@@ -52,6 +52,14 @@ impl Page {
     pub fn content_line_count(&self) -> usize {
         self.content_lines().len()
     }
+
+    pub fn raw_lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    pub fn raw_lines_sans_marker(&self) -> &[String] {
+        if self.lines.is_empty() { &self.lines } else { &self.lines[1..] }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,10 +198,18 @@ pub fn format_pages_table(pages: &[Page]) -> String {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineMode {
+    Content,
+    Raw,
+    NoMarkers,
+}
+
 pub fn collect_page_lines(
     pages: &[Page],
     start: usize,
     end: usize,
+    mode: LineMode,
 ) -> Result<Vec<String>, ChunkerError> {
     let mut lines = Vec::new();
     for num in start..=end {
@@ -201,7 +217,17 @@ pub fn collect_page_lines(
             .iter()
             .find(|p| p.number == num)
             .ok_or(ChunkerError::PageNotFound(num))?;
-        lines.extend(page.content_lines().into_iter().map(|s| s.to_string()));
+        match mode {
+            LineMode::Content => {
+                lines.extend(page.content_lines().into_iter().map(|s| s.to_string()));
+            }
+            LineMode::Raw => {
+                lines.extend_from_slice(page.raw_lines());
+            }
+            LineMode::NoMarkers => {
+                lines.extend_from_slice(page.raw_lines_sans_marker());
+            }
+        }
     }
     Ok(lines)
 }
@@ -351,6 +377,12 @@ pub enum Commands {
     Lines {
         /// Page number or range (e.g. "5" or "5-10")
         page: String,
+        /// Output all original lines including the page marker
+        #[arg(long)]
+        raw: bool,
+        /// Output all lines except the page marker comment (blanks preserved)
+        #[arg(long)]
+        no_markers: bool,
     },
     /// Search for a term across all pages
     Search {
@@ -397,9 +429,16 @@ fn run() -> Result<(), ChunkerError> {
                 print!("{}", format_pages_table(&pages));
             }
         }
-        Commands::Lines { page } => {
+        Commands::Lines { page, raw, no_markers } => {
             let (start, end) = parse_page_range(&page)?;
-            let lines = collect_page_lines(&pages, start, end)?;
+            let mode = if raw {
+                LineMode::Raw
+            } else if no_markers {
+                LineMode::NoMarkers
+            } else {
+                LineMode::Content
+            };
+            let lines = collect_page_lines(&pages, start, end, mode)?;
             if cli.json {
                 println!("{}", lines_to_json(&lines, start, end));
             } else {
@@ -635,14 +674,14 @@ Third page only line";
     #[test]
     fn test_collect_single_page_lines() {
         let pages = parse_pages(SAMPLE).unwrap();
-        let lines = collect_page_lines(&pages, 0, 0).unwrap();
+        let lines = collect_page_lines(&pages, 0, 0, LineMode::Content).unwrap();
         assert_eq!(lines, vec!["First page line one", "First page line two"]);
     }
 
     #[test]
     fn test_collect_page_range_lines() {
         let pages = parse_pages(SAMPLE).unwrap();
-        let lines = collect_page_lines(&pages, 0, 1).unwrap();
+        let lines = collect_page_lines(&pages, 0, 1, LineMode::Content).unwrap();
         assert_eq!(
             lines,
             vec![
@@ -656,7 +695,7 @@ Third page only line";
     #[test]
     fn test_collect_page_not_found() {
         let pages = parse_pages(SAMPLE).unwrap();
-        let result = collect_page_lines(&pages, 99, 99);
+        let result = collect_page_lines(&pages, 99, 99, LineMode::Content);
         assert!(matches!(result, Err(ChunkerError::PageNotFound(99))));
     }
 
@@ -700,7 +739,7 @@ Third page only line";
     #[test]
     fn test_lines_json_is_valid() {
         let pages = parse_pages(SAMPLE).unwrap();
-        let lines = collect_page_lines(&pages, 0, 0).unwrap();
+        let lines = collect_page_lines(&pages, 0, 0, LineMode::Content).unwrap();
         let json_str = lines_to_json(&lines, 0, 0);
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["lines"].as_array().unwrap().len(), 2);
@@ -768,7 +807,7 @@ Third page only line";
         let pages = parse_pages(input).unwrap();
         assert_eq!(pages.len(), 3);
         // Range 0-10 should fail because pages 1-4 don't exist
-        let result = collect_page_lines(&pages, 0, 10);
+        let result = collect_page_lines(&pages, 0, 10, LineMode::Content);
         assert!(matches!(result, Err(ChunkerError::PageNotFound(1))));
     }
 
@@ -782,7 +821,7 @@ Third page only line";
         assert_eq!(pages[0].number, 3);
         assert_eq!(pages[1].number, 3);
         // collect_page_lines finds the first one
-        let lines = collect_page_lines(&pages, 3, 3).unwrap();
+        let lines = collect_page_lines(&pages, 3, 3, LineMode::Content).unwrap();
         assert_eq!(lines, vec!["first version"]);
     }
 
@@ -867,5 +906,83 @@ Third page only line";
         let input = "<!-- Page 0 - 123 images -->\nsome content";
         let pages = parse_pages(input).unwrap();
         assert_eq!(pages[0].image_count, 123);
+    }
+
+    // -- raw_lines / raw_lines_sans_marker ------------------------------------
+
+    #[test]
+    fn test_raw_lines_include_marker_and_blanks() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let raw = pages[0].raw_lines();
+        // Page 0 has: marker, "First page line one", "First page line two", blank line
+        assert_eq!(raw[0], "<!-- Page 0 - 2 images -->");
+        assert_eq!(raw[1], "First page line one");
+        assert_eq!(raw[2], "First page line two");
+        assert_eq!(raw[3], "");
+        assert_eq!(raw.len(), 4);
+    }
+
+    #[test]
+    fn test_no_markers_lines_skip_marker_keep_blanks() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let sans = pages[0].raw_lines_sans_marker();
+        // Same as raw but without the marker at index 0
+        assert_eq!(sans.len(), 3);
+        assert_eq!(sans[0], "First page line one");
+        assert_eq!(sans[1], "First page line two");
+        assert_eq!(sans[2], "");
+    }
+
+    // -- collect_page_lines with LineMode -------------------------------------
+
+    #[test]
+    fn test_collect_raw_single_page() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let lines = collect_page_lines(&pages, 0, 0, LineMode::Raw).unwrap();
+        assert_eq!(lines[0], "<!-- Page 0 - 2 images -->");
+        assert_eq!(lines[1], "First page line one");
+        assert_eq!(lines[2], "First page line two");
+        assert_eq!(lines[3], "");
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn test_collect_no_markers_single_page() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let lines = collect_page_lines(&pages, 0, 0, LineMode::NoMarkers).unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "First page line one");
+        assert_eq!(lines[1], "First page line two");
+        assert_eq!(lines[2], "");
+    }
+
+    #[test]
+    fn test_raw_lines_range() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let lines = collect_page_lines(&pages, 0, 1, LineMode::Raw).unwrap();
+        // Page 0: marker + 2 content + blank = 4 lines
+        // Page 1: marker + content = 2 lines
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0], "<!-- Page 0 - 2 images -->");
+        assert_eq!(lines[4], "<!-- Page 1 - 3 images -->");
+        assert_eq!(lines[5], "Second page content");
+    }
+
+    #[test]
+    fn test_no_markers_range() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let lines = collect_page_lines(&pages, 0, 1, LineMode::NoMarkers).unwrap();
+        // Page 0 sans marker: 3 lines; Page 1 sans marker: 1 line
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "First page line one");
+        assert_eq!(lines[3], "Second page content");
+    }
+
+    #[test]
+    fn test_collect_content_mode_unchanged() {
+        // Default Content mode should behave identically to the original
+        let pages = parse_pages(SAMPLE).unwrap();
+        let lines = collect_page_lines(&pages, 0, 0, LineMode::Content).unwrap();
+        assert_eq!(lines, vec!["First page line one", "First page line two"]);
     }
 }

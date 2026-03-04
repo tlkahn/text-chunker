@@ -1,0 +1,136 @@
+# text-chunker
+
+A Rust CLI tool for splitting page-marked documents into chunks. Built for OCR-processed Sanskrit manuscripts that use HTML comment markers (`<!-- Page N - M images -->`) to delimit pages.
+
+## Installation
+
+```bash
+cargo install --path .
+```
+
+## Page marker format
+
+The tool recognises markers of the form:
+
+```html
+<!-- Page 0 - 2 images -->
+<!-- Page 1 - 3 images -->
+<!-- Page 42 - 1 image -->
+```
+
+Whitespace inside the marker is flexible. Both `image` and `images` are accepted. Content before the first marker is silently ignored.
+
+## Usage
+
+```
+text-chunker [--json] <FILE> <COMMAND>
+```
+
+`<FILE>` is a `.md` or `.txt` file path, or `-` for stdin.
+
+### Pages summary
+
+```bash
+text-chunker manuscript.md pages
+```
+
+```
+Page     Images   Lines          Content
+----------------------------------------------
+0        2        1-84           45
+1        0        85-140         37
+2        0        141-200        42
+----------------------------------------------
+Total: 3 pages, 124 content lines
+```
+
+Pages with no content lines are flagged as `[empty]`.
+
+### Extract lines from a page
+
+```bash
+text-chunker manuscript.md lines 5              # single page (content only)
+text-chunker manuscript.md lines 5-10           # page range
+text-chunker manuscript.md lines --raw 5        # all original lines including marker
+text-chunker manuscript.md lines --no-markers 5 # all lines except marker comment
+```
+
+By default, outputs non-empty content lines (marker lines and blank lines are excluded). Use `--raw` for verbatim original lines (marker + blanks + content), or `--no-markers` for all lines except the marker comment (blanks preserved).
+
+### Search across pages
+
+```bash
+text-chunker manuscript.md search "bhairava"
+```
+
+Case-insensitive search. Only content lines are searched (markers are excluded). Results are grouped by page number.
+
+### Split into individual files
+
+```bash
+text-chunker manuscript.md split --outdir ./pages
+```
+
+Writes each page as `page-000.md`, `page-001.md`, etc. into the output directory (created if it doesn't exist).
+
+### JSON output
+
+Add `--json` to any subcommand for machine-readable output:
+
+```bash
+text-chunker manuscript.md --json pages
+text-chunker manuscript.md --json lines 5
+text-chunker manuscript.md --json search "śiva"
+```
+
+### Stdin
+
+```bash
+cat manuscript.md | text-chunker - pages
+```
+
+Extension validation is skipped when reading from stdin.
+
+## Tips: composing with other tools
+
+`text-chunker` is designed to replace fragile `sed -n 'X,Yp'` range calculations by handling page boundaries for you. It composes naturally with other CLI tools:
+
+```bash
+# Copy page content to clipboard
+text-chunker file.md lines 5 | pbcopy
+
+# Search within a specific page
+text-chunker file.md lines 5 | grep "śiva"
+
+# Word count of a page
+text-chunker file.md lines 5 | wc -w
+
+# Extract lines as JSON array via jq
+text-chunker file.md --json lines 5 | jq -r '.lines[]'
+
+# Pre-filter a file, then chunk
+cat file.md | sed 's/foo/bar/g' | text-chunker - lines 5
+
+# Pipe page content to an LLM
+text-chunker file.md lines 5 | claude -p "Translate this Sanskrit"
+```
+
+Quick shell function for repeated use:
+
+```bash
+page() { text-chunker "$1" lines "$2"; }
+page manuscript.md 5
+page manuscript.md 5-10
+```
+
+## Testing
+
+```bash
+cargo test
+```
+
+54 tests covering parsing, search, output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, etc.).
+
+## License
+
+MIT
