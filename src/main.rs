@@ -746,4 +746,126 @@ Third page only line";
         assert_eq!(pages[0].content_line_count(), 0);
         assert_eq!(pages[1].content_line_count(), 1);
     }
+
+    // -- edge cases ----------------------------------------------------------
+
+    // #1 Content before first marker is silently dropped
+    #[test]
+    fn test_content_before_first_marker_dropped() {
+        let input = "preamble line\nanother line\n<!-- Page 0 - 1 image -->\nreal content";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].number, 0);
+        let cl = pages[0].content_lines();
+        assert_eq!(cl, vec!["real content"]);
+        assert!(!cl.iter().any(|l| l.contains("preamble")));
+    }
+
+    // #2 Non-sequential page numbers — range query hits gap
+    #[test]
+    fn test_non_sequential_pages_range_gap() {
+        let input = "<!-- Page 0 - 1 image -->\nline a\n<!-- Page 5 - 1 image -->\nline b\n<!-- Page 10 - 1 image -->\nline c";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 3);
+        // Range 0-10 should fail because pages 1-4 don't exist
+        let result = collect_page_lines(&pages, 0, 10);
+        assert!(matches!(result, Err(ChunkerError::PageNotFound(1))));
+    }
+
+    // #3 Duplicate page numbers — find returns first
+    #[test]
+    fn test_duplicate_page_numbers() {
+        let input = "<!-- Page 3 - 1 image -->\nfirst version\n<!-- Page 3 - 2 images -->\nsecond version";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 2);
+        // Both have number 3
+        assert_eq!(pages[0].number, 3);
+        assert_eq!(pages[1].number, 3);
+        // collect_page_lines finds the first one
+        let lines = collect_page_lines(&pages, 3, 3).unwrap();
+        assert_eq!(lines, vec!["first version"]);
+    }
+
+    // #4 Consecutive markers with no content between them
+    #[test]
+    fn test_consecutive_markers_no_content() {
+        let input = "<!-- Page 0 - 1 image -->\n<!-- Page 1 - 1 image -->\nsome content";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].content_line_count(), 0);
+        assert_eq!(pages[1].content_line_count(), 1);
+    }
+
+    // #5 Windows line endings (\r\n) — content lines should be clean
+    #[test]
+    fn test_windows_line_endings() {
+        let input = "<!-- Page 0 - 1 image -->\r\ncontent with cr\r\n\r\n<!-- Page 1 - 1 image -->\r\nsecond page";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 2);
+        let cl = pages[0].content_lines();
+        // Should not have trailing \r
+        assert_eq!(cl, vec!["content with cr"]);
+        assert!(!cl[0].ends_with('\r'));
+    }
+
+    // #6 Zero images
+    #[test]
+    fn test_zero_images() {
+        let input = "<!-- Page 0 - 0 images -->\nsome line";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages[0].image_count, 0);
+    }
+
+    // #7 Unicode / Devanagari search
+    #[test]
+    fn test_unicode_search() {
+        let input = "<!-- Page 0 - 1 image -->\nnamaḥ śivāya\noṃ bhairavāya namaḥ";
+        let pages = parse_pages(input).unwrap();
+        let results = search_pages(&pages, "śivāya");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].line.contains("śivāya"));
+    }
+
+    // #8 Last page is just a marker line with no trailing content
+    #[test]
+    fn test_last_page_marker_only() {
+        let input = "<!-- Page 0 - 1 image -->\ncontent\n<!-- Page 1 - 1 image -->";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1].content_line_count(), 0);
+    }
+
+    // #9 Page range "0-0" parses correctly
+    #[test]
+    fn test_page_range_zero_zero() {
+        let (start, end) = parse_page_range("0-0").unwrap();
+        assert_eq!((start, end), (0, 0));
+    }
+
+    // #10 Split to non-writable directory propagates IO error
+    #[test]
+    fn test_split_non_writable_dir() {
+        let input = "<!-- Page 0 - 1 image -->\ncontent";
+        let pages = parse_pages(input).unwrap();
+        let result = split_pages(&pages, std::path::Path::new("/nonexistent/deeply/nested/dir"));
+        assert!(matches!(result, Err(ChunkerError::Io(_))));
+    }
+
+    // #11 Marker with extra whitespace
+    #[test]
+    fn test_marker_extra_whitespace() {
+        let input = "<!--  Page  0  -  2  images  -->\nsome content";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].number, 0);
+        assert_eq!(pages[0].image_count, 2);
+    }
+
+    // #12 Multi-digit image counts
+    #[test]
+    fn test_multi_digit_image_count() {
+        let input = "<!-- Page 0 - 123 images -->\nsome content";
+        let pages = parse_pages(input).unwrap();
+        assert_eq!(pages[0].image_count, 123);
+    }
 }
