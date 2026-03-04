@@ -23,7 +23,7 @@ Whitespace inside the marker is flexible. Both `image` and `images` are accepted
 ## Usage
 
 ```
-text-chunker [--json] <FILE> <COMMAND>
+text-chunker [--json] <COMMAND> <FILE> [ARGS...]
 ```
 
 `<FILE>` is a `.md` or `.txt` file path, or `-` for stdin.
@@ -31,7 +31,7 @@ text-chunker [--json] <FILE> <COMMAND>
 ### Pages summary
 
 ```bash
-text-chunker manuscript.md pages
+text-chunker pages manuscript.md
 ```
 
 ```
@@ -49,10 +49,10 @@ Pages with no content lines are flagged as `[empty]`.
 ### Extract lines from a page
 
 ```bash
-text-chunker manuscript.md lines 5              # single page (content only)
-text-chunker manuscript.md lines 5-10           # page range
-text-chunker manuscript.md lines --raw 5        # all original lines including marker
-text-chunker manuscript.md lines --no-markers 5 # all lines except marker comment
+text-chunker lines manuscript.md 5              # single page (content only)
+text-chunker lines manuscript.md 5-10           # page range
+text-chunker lines manuscript.md 5 --raw        # all original lines including marker
+text-chunker lines manuscript.md 5 --no-markers # all lines except marker comment
 ```
 
 By default, outputs non-empty content lines (marker lines and blank lines are excluded). Use `--raw` for verbatim original lines (marker + blanks + content), or `--no-markers` for all lines except the marker comment (blanks preserved).
@@ -60,7 +60,7 @@ By default, outputs non-empty content lines (marker lines and blank lines are ex
 ### Search across pages
 
 ```bash
-text-chunker manuscript.md search "bhairava"
+text-chunker search manuscript.md "bhairava"
 ```
 
 Case-insensitive search. Only content lines are searched (markers are excluded). Results are grouped by page number.
@@ -68,7 +68,7 @@ Case-insensitive search. Only content lines are searched (markers are excluded).
 ### Split into individual files
 
 ```bash
-text-chunker manuscript.md split --outdir ./pages
+text-chunker split manuscript.md --outdir ./pages
 ```
 
 Writes each page as `page-000.md`, `page-001.md`, etc. into the output directory (created if it doesn't exist).
@@ -78,15 +78,15 @@ Writes each page as `page-000.md`, `page-001.md`, etc. into the output directory
 Add `--json` to any subcommand for machine-readable output:
 
 ```bash
-text-chunker manuscript.md --json pages
-text-chunker manuscript.md --json lines 5
-text-chunker manuscript.md --json search "śiva"
+text-chunker --json pages manuscript.md
+text-chunker --json lines manuscript.md 5
+text-chunker --json search manuscript.md "śiva"
 ```
 
 ### Stdin
 
 ```bash
-cat manuscript.md | text-chunker - pages
+cat manuscript.md | text-chunker pages -
 ```
 
 Extension validation is skipped when reading from stdin.
@@ -97,28 +97,28 @@ Extension validation is skipped when reading from stdin.
 
 ```bash
 # Copy page content to clipboard
-text-chunker file.md lines 5 | pbcopy
+text-chunker lines file.md 5 | pbcopy
 
 # Search within a specific page
-text-chunker file.md lines 5 | grep "śiva"
+text-chunker lines file.md 5 | grep "śiva"
 
 # Word count of a page
-text-chunker file.md lines 5 | wc -w
+text-chunker lines file.md 5 | wc -w
 
 # Extract lines as JSON array via jq
-text-chunker file.md --json lines 5 | jq -r '.lines[]'
+text-chunker --json lines file.md 5 | jq -r '.lines[]'
 
 # Pre-filter a file, then chunk
-cat file.md | sed 's/foo/bar/g' | text-chunker - lines 5
+cat file.md | sed 's/foo/bar/g' | text-chunker lines - 5
 
 # Pipe page content to an LLM
-text-chunker file.md lines 5 | claude -p "Translate this Sanskrit"
+text-chunker lines file.md 5 | claude -p "Translate this Sanskrit"
 ```
 
 Quick shell function for repeated use:
 
 ```bash
-page() { text-chunker "$1" lines "$2"; }
+page() { text-chunker lines "$1" "$2"; }
 page manuscript.md 5
 page manuscript.md 5-10
 ```

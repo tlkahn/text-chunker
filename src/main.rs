@@ -358,9 +358,6 @@ pub fn validate_extension(path: &str) -> Result<(), ChunkerError> {
 #[derive(Parser)]
 #[command(name = "text-chunker", about = "Split page-marked documents into chunks")]
 pub struct Cli {
-    /// Input file path, or "-" for stdin
-    pub file: String,
-
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
@@ -372,9 +369,14 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Show summary table of all pages
-    Pages,
+    Pages {
+        /// Input file path, or "-" for stdin
+        file: String,
+    },
     /// Show non-empty lines of a page or page range (e.g. 5 or 5-10)
     Lines {
+        /// Input file path, or "-" for stdin
+        file: String,
         /// Page number or range (e.g. "5" or "5-10")
         page: String,
         /// Output all original lines including the page marker
@@ -386,11 +388,15 @@ pub enum Commands {
     },
     /// Search for a term across all pages
     Search {
+        /// Input file path, or "-" for stdin
+        file: String,
         /// Search term (case-insensitive)
         term: String,
     },
     /// Split pages into individual files
     Split {
+        /// Input file path, or "-" for stdin
+        file: String,
         /// Output directory
         #[arg(long)]
         outdir: PathBuf,
@@ -418,18 +424,25 @@ fn read_input(file: &str) -> Result<String, ChunkerError> {
 
 fn run() -> Result<(), ChunkerError> {
     let cli = Cli::parse();
-    let content = read_input(&cli.file)?;
+
+    let file = match &cli.command {
+        Commands::Pages { file }
+        | Commands::Lines { file, .. }
+        | Commands::Search { file, .. }
+        | Commands::Split { file, .. } => file.as_str(),
+    };
+    let content = read_input(file)?;
     let pages = parse_pages(&content)?;
 
     match cli.command {
-        Commands::Pages => {
+        Commands::Pages { .. } => {
             if cli.json {
                 println!("{}", pages_to_json(&pages));
             } else {
                 print!("{}", format_pages_table(&pages));
             }
         }
-        Commands::Lines { page, raw, no_markers } => {
+        Commands::Lines { page, raw, no_markers, .. } => {
             let (start, end) = parse_page_range(&page)?;
             let mode = if raw {
                 LineMode::Raw
@@ -447,7 +460,7 @@ fn run() -> Result<(), ChunkerError> {
                 }
             }
         }
-        Commands::Search { term } => {
+        Commands::Search { term, .. } => {
             let matches = search_pages(&pages, &term);
             if cli.json {
                 println!("{}", search_to_json(&matches, &term));
@@ -455,7 +468,7 @@ fn run() -> Result<(), ChunkerError> {
                 print!("{}", format_search_results(&matches));
             }
         }
-        Commands::Split { outdir } => {
+        Commands::Split { outdir, .. } => {
             split_pages(&pages, &outdir)?;
             if cli.json {
                 #[derive(Serialize)]
