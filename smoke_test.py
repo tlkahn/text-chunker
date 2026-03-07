@@ -6,7 +6,7 @@
 """
 MCP Smoke Test -- Python Agent calling the text-chunker MCP server
 
-Exercises all three MCP tools (pages, lines, search) against a
+Exercises all four MCP tools (pages, lines, search, split) against a
 temporary fixture file with page markers.
 
 Usage:
@@ -36,6 +36,7 @@ BOLD = "\033[1m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
 RESET = "\033[0m"
 
 BINARY = os.path.join(
@@ -63,6 +64,7 @@ TOOL_LABELS = {
     "pages": ("Listing pages", GREEN),
     "lines": ("Reading lines", CYAN),
     "search": ("Searching", YELLOW),
+    "split": ("Splitting", MAGENTA),
 }
 
 
@@ -103,6 +105,8 @@ async def main():
         f.write(FIXTURE)
         fixture_path = f.name
 
+    split_dir = tempfile.mkdtemp(prefix="text-chunker-split-")
+
     try:
         options = ClaudeAgentOptions(
             model="claude-haiku-4-5",
@@ -113,10 +117,12 @@ Available tools:
 - pages(file) -- list all pages with metadata
 - lines(file, page, mode?) -- get lines from a page or range
 - search(file, term) -- search for text across all pages
+- split(file, outdir) -- split into individual page files
 
 The test document is at: {fixture_path}
+The output directory for split is: {split_dir}
 
-IMPORTANT: You must call ALL THREE tools (pages, lines, search) to
+IMPORTANT: You must call ALL FOUR tools (pages, lines, search, split) to
 answer the user's question. Do not skip any tool calls.""",
             mcp_servers={
                 "text-chunker": {
@@ -133,7 +139,8 @@ answer the user's question. Do not skip any tool calls.""",
             f"Using the file at {fixture_path}: "
             "1) List all pages, "
             "2) Show the lines from page 1, "
-            "3) Search for the word 'quick'"
+            "3) Search for the word 'quick', "
+            f"4) Split the document into {split_dir}"
         )
 
         print(f"{BOLD}text-chunker MCP Smoke Test{RESET}")
@@ -161,16 +168,18 @@ answer the user's question. Do not skip any tool calls.""",
                 turns = message.num_turns
                 print(f"\n{DIM}  ({turns} turns, ${cost:.4f}){RESET}")
 
-        # Verify all three tools were exercised
-        expected = {"pages", "lines", "search"}
+        # Verify all four tools were exercised
+        expected = {"pages", "lines", "search", "split"}
         missing = expected - tools_called
         if missing:
             print(f"\n{BOLD}FAIL:{RESET} Tools not called: {missing}")
         else:
-            print(f"\n{GREEN}{BOLD}PASS:{RESET} All three tools exercised ({', '.join(sorted(tools_called))})")
+            print(f"\n{GREEN}{BOLD}PASS:{RESET} All four tools exercised ({', '.join(sorted(tools_called))})")
 
     finally:
         os.unlink(fixture_path)
+        import shutil
+        shutil.rmtree(split_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

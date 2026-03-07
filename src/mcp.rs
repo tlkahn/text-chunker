@@ -1,7 +1,8 @@
 use crate::{
     ChunkerError, LineMode, collect_page_lines, lines_to_json, pages_to_json, parse_page_range,
-    parse_pages, search_pages, search_to_json, validate_extension,
+    parse_pages, search_pages, search_to_json, split_pages, validate_extension,
 };
+use serde::Serialize;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -47,6 +48,28 @@ pub fn handle_search_content(content: &str, term: &str) -> Result<String, Chunke
     Ok(search_to_json(&matches, term))
 }
 
+pub fn handle_split_content(content: &str, outdir: &str) -> Result<String, ChunkerError> {
+    let pages = parse_pages(content)?;
+    let outdir_path = std::path::Path::new(outdir);
+    split_pages(&pages, outdir_path)?;
+    let files: Vec<String> = pages
+        .iter()
+        .map(|p| format!("page-{:03}.md", p.number))
+        .collect();
+    #[derive(Serialize)]
+    struct SplitJson {
+        pages_written: usize,
+        outdir: String,
+        files: Vec<String>,
+    }
+    let result = SplitJson {
+        pages_written: pages.len(),
+        outdir: outdir.to_string(),
+        files,
+    };
+    Ok(serde_json::to_string_pretty(&result).unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // File-reading wrappers
 // ---------------------------------------------------------------------------
@@ -67,6 +90,12 @@ pub fn handle_search(file: &str, term: &str) -> Result<String, ChunkerError> {
     validate_extension(file)?;
     let content = std::fs::read_to_string(file)?;
     handle_search_content(&content, term)
+}
+
+pub fn handle_split(file: &str, outdir: &str) -> Result<String, ChunkerError> {
+    validate_extension(file)?;
+    let content = std::fs::read_to_string(file)?;
+    handle_split_content(&content, outdir)
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +124,14 @@ pub struct SearchInput {
     pub file: String,
     /// Search term (case-insensitive substring match)
     pub term: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SplitInput {
+    /// Path to a .md or .txt file containing page markers
+    pub file: String,
+    /// Output directory to write individual page files into (created if it doesn't exist)
+    pub outdir: String,
 }
 
 #[derive(Clone)]
@@ -142,6 +179,17 @@ impl TextChunkerMcp {
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
         }
     }
+
+    #[tool(description = "Split a page-marked document into individual page files. Each page is written as page-000.md, page-001.md, etc. Returns JSON with pages_written count and file list.")]
+    fn split(
+        &self,
+        Parameters(input): Parameters<SplitInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match handle_split(&input.file, &input.outdir) {
+            Ok(json) => Ok(CallToolResult::success(vec![Content::text(json)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
+    }
 }
 
 #[tool_handler]
@@ -154,7 +202,8 @@ impl ServerHandler for TextChunkerMcp {
             ))
             .with_instructions(
                 "text-chunker: split and query page-marked manuscripts (<!-- Page N - M images -->). \
-                 Use 'pages' to list all pages, 'lines' to read specific pages, 'search' to find text.",
+                 Use 'pages' to list all pages, 'lines' to read specific pages, 'search' to find text, \
+                 'split' to write individual page files.",
             )
     }
 }
@@ -313,5 +362,51 @@ Third page only line";
     fn test_search_content_empty_file() {
         let result = handle_search_content("", "anything");
         assert!(matches!(result, Err(ChunkerError::EmptyFile)));
+    }
+
+    // -- handle_split_content ------------------------------------------------
+
+    #[test]
+    fn test_split_content_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = handle_split_content(SAMPLE, dir.path().to_str().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["pages_written"], 3);
+        assert!(v["outdir"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn test_split_content_creates_files() {
+        let dir = tempfile::tempdir().unwrap();
+        handle_split_content(SAMPLE, dir.path().to_str().unwrap()).unwrap();
+        assert!(dir.path().join("page-000.md").exists());
+        assert!(dir.path().join("page-001.md").exists());
+        assert!(dir.path().join("page-002.md").exists());
+    }
+
+    #[test]
+    fn test_split_content_returns_files_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = handle_split_content(SAMPLE, dir.path().to_str().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let files = v["files"].as_array().unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].as_str().unwrap(), "page-000.md");
+        assert_eq!(files[1].as_str().unwrap(), "page-001.md");
+        assert_eq!(files[2].as_str().unwrap(), "page-002.md");
+    }
+
+    #[test]
+    fn test_split_content_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_split_content("", dir.path().to_str().unwrap());
+        assert!(matches!(result, Err(ChunkerError::EmptyFile)));
+    }
+
+    #[test]
+    fn test_split_content_no_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = handle_split_content("just text", dir.path().to_str().unwrap());
+        assert!(matches!(result, Err(ChunkerError::NoPagesFound)));
     }
 }

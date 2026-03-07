@@ -2,6 +2,8 @@
 
 A Rust CLI tool for splitting page-marked documents into chunks. Built for OCR-processed Sanskrit manuscripts that use HTML comment markers (`<!-- Page N - M images -->`) to delimit pages.
 
+Includes an MCP (Model Context Protocol) server so LLM agents can query pages, lines, and search results programmatically over stdio.
+
 ## Installation
 
 ```bash
@@ -123,13 +125,60 @@ page manuscript.md 5
 page manuscript.md 5-10
 ```
 
+## MCP Server
+
+Start the MCP server over stdio:
+
+```bash
+text-chunker mcp
+```
+
+This exposes three tools to any MCP-compatible client:
+
+| Tool | Description |
+|------|-------------|
+| `pages` | List all pages with metadata (page numbers, image counts, line ranges, content line counts) |
+| `lines` | Get lines from a page or range, with optional `mode` (`content`, `raw`, `no_markers`) |
+| `search` | Case-insensitive substring search across all pages |
+
+All tools accept a `file` parameter (path to a `.md` or `.txt` file) and return JSON.
+
+### Claude Desktop / MCP client config
+
+```json
+{
+  "mcpServers": {
+    "text-chunker": {
+      "type": "stdio",
+      "command": "text-chunker",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### MCP Inspector
+
+```bash
+npx @modelcontextprotocol/inspector cargo run --release -- mcp
+```
+
+### Smoke test
+
+A Python smoke test exercises all three tools via the Claude Agent SDK:
+
+```bash
+cargo build --release
+uv run smoke_test.py
+```
+
 ## Testing
 
 ```bash
 cargo test
 ```
 
-54 tests covering parsing, search, output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, etc.).
+76 tests covering parsing, search, output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), MCP handler functions, and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, etc.).
 
 ## License
 
