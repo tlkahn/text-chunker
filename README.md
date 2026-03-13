@@ -2,7 +2,7 @@
 
 A Rust CLI tool for splitting page-marked documents into chunks. Built for OCR-processed Sanskrit manuscripts that use HTML comment markers (`<!-- Page N - M images -->`) to delimit pages.
 
-Includes an MCP (Model Context Protocol) server so LLM agents can query pages, lines, and search results programmatically over stdio.
+Includes structural markdown chunking (headings, paragraphs, lists, code blocks, tables, blockquotes) for embedding into vector databases, and an MCP (Model Context Protocol) server so LLM agents can query pages, lines, search results, and chunks programmatically over stdio.
 
 ## Installation
 
@@ -75,6 +75,34 @@ text-chunker split manuscript.md --outdir ./pages
 
 Writes each page as `page-000.md`, `page-001.md`, etc. into the output directory (created if it doesn't exist).
 
+### Chunk markdown into structural segments
+
+```bash
+text-chunker chunks manuscript.md              # document-level chunking
+text-chunker chunks manuscript.md --per-page   # chunk within each page separately
+```
+
+**Document mode** (default) treats the entire file as continuous markdown — no page markers required. Works on any `.md` file. **Per-page mode** requires page markers; it chunks each page independently so heading context doesn't bleed across pages.
+
+```
+#      Type         Lines          Text
+------------------------------------------------------------------------
+1      heading      1-1            Chapter 1
+2      paragraph    3-3            The quick brown fox jumps over the...
+3      list_item    5-5            First item
+4      list_item    6-6            Second item
+5      code_block   8-10           let x = 1;
+------------------------------------------------------------------------
+Total: 5 chunks
+```
+
+Each chunk includes:
+- **text** — clean extracted text (markdown syntax stripped)
+- **chunk_type** — `heading`, `paragraph`, `list_item`, `code_block`, `table`, or `block_quote`
+- **heading_context** — ancestor heading hierarchy, e.g. `["Chapter 1", "Background"]`
+- **source_line_start / source_line_end** — 1-based source line numbers
+- **page_number** — set in per-page mode
+
 ### JSON output
 
 Add `--json` to any subcommand for machine-readable output:
@@ -83,6 +111,8 @@ Add `--json` to any subcommand for machine-readable output:
 text-chunker --json pages manuscript.md
 text-chunker --json lines manuscript.md 5
 text-chunker --json search manuscript.md "śiva"
+text-chunker --json chunks manuscript.md
+text-chunker --json chunks manuscript.md --per-page
 ```
 
 ### Stdin
@@ -133,13 +163,15 @@ Start the MCP server over stdio:
 text-chunker mcp
 ```
 
-This exposes three tools to any MCP-compatible client:
+This exposes five tools to any MCP-compatible client:
 
 | Tool | Description |
 |------|-------------|
 | `pages` | List all pages with metadata (page numbers, image counts, line ranges, content line counts) |
 | `lines` | Get lines from a page or range, with optional `mode` (`content`, `raw`, `no_markers`) |
 | `search` | Case-insensitive substring search across all pages |
+| `chunks` | Chunk markdown into structural segments for embedding, with optional `per_page` mode |
+| `split` | Split pages into individual files in a given output directory |
 
 All tools accept a `file` parameter (path to a `.md` or `.txt` file) and return JSON.
 
@@ -165,7 +197,7 @@ npx @modelcontextprotocol/inspector cargo run --release -- mcp
 
 ### Smoke test
 
-A Python smoke test exercises all three tools via the Claude Agent SDK:
+A Python smoke test exercises all five tools via the Claude Agent SDK:
 
 ```bash
 cargo build --release
@@ -178,7 +210,7 @@ uv run smoke_test.py
 cargo test
 ```
 
-76 tests covering parsing, search, output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), MCP handler functions, and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, etc.).
+108 tests covering parsing, search, structural chunking, output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), MCP handler functions, and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, heading context isolation, etc.).
 
 ## License
 

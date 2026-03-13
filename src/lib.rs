@@ -1,3 +1,4 @@
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error;
@@ -366,6 +367,358 @@ pub fn search_to_json(matches: &[SearchMatch], term: &str) -> String {
         matches,
     };
     serde_json::to_string_pretty(&output).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Chunk types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkType {
+    Heading,
+    Paragraph,
+    ListItem,
+    CodeBlock,
+    Table,
+    BlockQuote,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Chunk {
+    pub text: String,
+    pub chunk_type: ChunkType,
+    pub heading_context: Vec<String>,
+    pub heading_level: Option<u8>,
+    pub page_number: Option<usize>,
+    pub source_line_start: usize,
+    pub source_line_end: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Line index helpers
+// ---------------------------------------------------------------------------
+
+pub fn build_line_index(content: &str) -> Vec<usize> {
+    let mut index = vec![0];
+    for (i, b) in content.bytes().enumerate() {
+        if b == b'\n' && i + 1 <= content.len() {
+            index.push(i + 1);
+        }
+    }
+    index
+}
+
+pub fn byte_offset_to_line(index: &[usize], offset: usize) -> usize {
+    match index.binary_search(&offset) {
+        Ok(pos) => pos + 1,
+        Err(pos) => pos,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core chunking algorithm
+// ---------------------------------------------------------------------------
+
+pub fn chunk_markdown(content: &str) -> Vec<Chunk> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let line_index = build_line_index(content);
+
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_MATH);
+
+    let parser = Parser::new_ext(content, opts).into_offset_iter();
+
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut heading_stack: Vec<(u8, String)> = Vec::new();
+
+    // State for current block being accumulated
+    let mut text_buf = String::new();
+    let mut block_type: Option<ChunkType> = None;
+    let mut block_start_offset: usize = 0;
+    #[allow(unused_assignments)]
+    let mut block_end_offset: usize = 0;
+    let mut current_heading_level: Option<u8> = None;
+
+    // Nesting depth for list items and blockquotes
+    let mut item_depth: usize = 0;
+    let mut blockquote_depth: usize = 0;
+    let mut _list_depth: usize = 0;
+
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                block_type = Some(ChunkType::Heading);
+                current_heading_level = Some(level as u8);
+                text_buf.clear();
+                block_start_offset = range.start;
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                block_end_offset = range.end;
+                let text = text_buf.trim().to_string();
+                if !text.is_empty() {
+                    let level = current_heading_level.unwrap();
+                    // Update heading stack: pop levels >= current
+                    heading_stack.retain(|(l, _)| *l < level);
+                    heading_stack.push((level, text.clone()));
+
+                    chunks.push(Chunk {
+                        text,
+                        chunk_type: ChunkType::Heading,
+                        heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                        heading_level: current_heading_level,
+                        page_number: None,
+                        source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                        source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                    });
+                }
+                block_type = None;
+                current_heading_level = None;
+                text_buf.clear();
+            }
+            Event::Start(Tag::Paragraph) => {
+                if item_depth == 0 && blockquote_depth == 0 {
+                    block_type = Some(ChunkType::Paragraph);
+                    text_buf.clear();
+                    block_start_offset = range.start;
+                }
+                // Inside items/blockquotes, paragraph text just accumulates
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if item_depth == 0 && blockquote_depth == 0 {
+                    block_end_offset = range.end;
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        chunks.push(Chunk {
+                            text,
+                            chunk_type: ChunkType::Paragraph,
+                            heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                            heading_level: None,
+                            page_number: None,
+                            source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                            source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                        });
+                    }
+                    block_type = None;
+                    text_buf.clear();
+                }
+            }
+            Event::Start(Tag::List(_)) => {
+                _list_depth += 1;
+            }
+            Event::End(TagEnd::List(_)) => {
+                _list_depth = _list_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Item) => {
+                item_depth += 1;
+                if item_depth == 1 {
+                    text_buf.clear();
+                    block_start_offset = range.start;
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                if item_depth == 1 {
+                    block_end_offset = range.end;
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        chunks.push(Chunk {
+                            text,
+                            chunk_type: ChunkType::ListItem,
+                            heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                            heading_level: None,
+                            page_number: None,
+                            source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                            source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                        });
+                    }
+                    text_buf.clear();
+                }
+                item_depth = item_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                block_type = Some(ChunkType::CodeBlock);
+                text_buf.clear();
+                block_start_offset = range.start;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                block_end_offset = range.end;
+                let text = text_buf.trim().to_string();
+                if !text.is_empty() {
+                    chunks.push(Chunk {
+                        text,
+                        chunk_type: ChunkType::CodeBlock,
+                        heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                        source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                    });
+                }
+                block_type = None;
+                text_buf.clear();
+            }
+            Event::Start(Tag::Table(_)) => {
+                block_type = Some(ChunkType::Table);
+                text_buf.clear();
+                block_start_offset = range.start;
+            }
+            Event::End(TagEnd::Table) => {
+                block_end_offset = range.end;
+                let text = text_buf.trim().to_string();
+                if !text.is_empty() {
+                    chunks.push(Chunk {
+                        text,
+                        chunk_type: ChunkType::Table,
+                        heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                        source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                    });
+                }
+                block_type = None;
+                text_buf.clear();
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                blockquote_depth += 1;
+                if blockquote_depth == 1 {
+                    block_type = Some(ChunkType::BlockQuote);
+                    text_buf.clear();
+                    block_start_offset = range.start;
+                }
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                if blockquote_depth == 1 {
+                    block_end_offset = range.end;
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        chunks.push(Chunk {
+                            text,
+                            chunk_type: ChunkType::BlockQuote,
+                            heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                            heading_level: None,
+                            page_number: None,
+                            source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                            source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                        });
+                    }
+                    block_type = None;
+                    text_buf.clear();
+                }
+                blockquote_depth = blockquote_depth.saturating_sub(1);
+            }
+            // Table cell separators
+            Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
+                if block_type == Some(ChunkType::Table) {
+                    text_buf.push('\n');
+                }
+            }
+            Event::End(TagEnd::TableCell) => {
+                if block_type == Some(ChunkType::Table) {
+                    text_buf.push('\t');
+                }
+            }
+            // Text content events
+            Event::Text(text) => {
+                text_buf.push_str(&text);
+            }
+            Event::Code(code) => {
+                text_buf.push_str(&code);
+            }
+            Event::SoftBreak => {
+                text_buf.push(' ');
+            }
+            Event::HardBreak => {
+                text_buf.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    chunks
+}
+
+// ---------------------------------------------------------------------------
+// Document + page wrappers
+// ---------------------------------------------------------------------------
+
+pub fn chunk_document(content: &str) -> Vec<Chunk> {
+    chunk_markdown(content)
+}
+
+pub fn chunk_pages(pages: &[Page]) -> Vec<Chunk> {
+    let mut all_chunks = Vec::new();
+    for page in pages {
+        let page_content = page.raw_lines_sans_marker().join("\n");
+        let mut chunks = chunk_markdown(&page_content);
+        for chunk in &mut chunks {
+            chunk.page_number = Some(page.number);
+            // Adjust line numbers: add page start_line offset (start_line is 1-based for the marker,
+            // content starts at start_line + 1, so offset is start_line)
+            chunk.source_line_start += page.start_line;
+            chunk.source_line_end += page.start_line;
+        }
+        all_chunks.extend(chunks);
+    }
+    all_chunks
+}
+
+// ---------------------------------------------------------------------------
+// Chunk output formatting
+// ---------------------------------------------------------------------------
+
+pub fn chunks_to_json(chunks: &[Chunk], mode: &str) -> String {
+    #[derive(Serialize)]
+    struct ChunksJson<'a> {
+        total_chunks: usize,
+        mode: &'a str,
+        chunks: &'a [Chunk],
+    }
+    let output = ChunksJson {
+        total_chunks: chunks.len(),
+        mode,
+        chunks,
+    };
+    serde_json::to_string_pretty(&output).unwrap()
+}
+
+pub fn format_chunks_table(chunks: &[Chunk]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<6} {:<12} {:<14} {}\n",
+        "#", "Type", "Lines", "Text"
+    ));
+    out.push_str(&format!("{}\n", "-".repeat(72)));
+    for (i, chunk) in chunks.iter().enumerate() {
+        let type_str = match chunk.chunk_type {
+            ChunkType::Heading => "heading",
+            ChunkType::Paragraph => "paragraph",
+            ChunkType::ListItem => "list_item",
+            ChunkType::CodeBlock => "code_block",
+            ChunkType::Table => "table",
+            ChunkType::BlockQuote => "block_quote",
+        };
+        let preview: String = chunk.text.chars().take(40).collect();
+        let preview = preview.replace('\n', " ");
+        let suffix = if chunk.text.len() > 40 { "..." } else { "" };
+        out.push_str(&format!(
+            "{:<6} {:<12} {:<14} {}{}\n",
+            i + 1,
+            type_str,
+            format!("{}-{}", chunk.source_line_start, chunk.source_line_end),
+            preview,
+            suffix
+        ));
+    }
+    out.push_str(&format!("{}\n", "-".repeat(72)));
+    out.push_str(&format!("Total: {} chunks\n", chunks.len()));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +1159,207 @@ Third page only line";
         let input = "<!-- Page 0 - 123 images -->\nsome content";
         let pages = parse_pages(input).unwrap();
         assert_eq!(pages[0].image_count, 123);
+    }
+
+    // -- build_line_index / byte_offset_to_line --------------------------------
+
+    #[test]
+    fn test_build_line_index_basic() {
+        let index = build_line_index("abc\ndef\nghi");
+        assert_eq!(index, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn test_byte_offset_to_line() {
+        let index = build_line_index("abc\ndef\nghi");
+        assert_eq!(byte_offset_to_line(&index, 0), 1); // 'a'
+        assert_eq!(byte_offset_to_line(&index, 4), 2); // 'd'
+        assert_eq!(byte_offset_to_line(&index, 5), 2); // 'e'
+    }
+
+    // -- chunk_markdown -------------------------------------------------------
+
+    #[test]
+    fn test_chunk_single_paragraph() {
+        let chunks = chunk_markdown("Hello world");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Paragraph);
+        assert_eq!(chunks[0].text, "Hello world");
+    }
+
+    #[test]
+    fn test_chunk_multiple_paragraphs() {
+        let chunks = chunk_markdown("First paragraph\n\nSecond paragraph");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "First paragraph");
+        assert_eq!(chunks[1].text, "Second paragraph");
+    }
+
+    #[test]
+    fn test_chunk_heading() {
+        let chunks = chunk_markdown("# Title");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Heading);
+        assert_eq!(chunks[0].heading_level, Some(1));
+        assert_eq!(chunks[0].text, "Title");
+    }
+
+    #[test]
+    fn test_chunk_heading_context() {
+        let chunks = chunk_markdown("# Title\n\nSome text");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1].chunk_type, ChunkType::Paragraph);
+        assert_eq!(chunks[1].heading_context, vec!["Title"]);
+    }
+
+    #[test]
+    fn test_chunk_heading_level_reset() {
+        let input = "# H1\n\n## H2\n\ntext under h2\n\n# New\n\ntext under new";
+        let chunks = chunk_markdown(input);
+        // Find the paragraph "text under new"
+        let last_para = chunks.iter().find(|c| c.text == "text under new").unwrap();
+        assert_eq!(last_para.heading_context, vec!["New"]);
+    }
+
+    #[test]
+    fn test_chunk_list_items() {
+        let chunks = chunk_markdown("- apple\n- banana");
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "apple");
+        assert_eq!(items[1].text, "banana");
+    }
+
+    #[test]
+    fn test_chunk_code_block() {
+        let chunks = chunk_markdown("```\nlet x = 1;\n```");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::CodeBlock);
+        assert_eq!(chunks[0].text, "let x = 1;");
+    }
+
+    #[test]
+    fn test_chunk_blockquote() {
+        let chunks = chunk_markdown("> quoted text");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::BlockQuote);
+        assert_eq!(chunks[0].text, "quoted text");
+    }
+
+    #[test]
+    fn test_chunk_table() {
+        let input = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let chunks = chunk_markdown(input);
+        let tables: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::Table).collect();
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].text.contains("A"));
+        assert!(tables[0].text.contains("B"));
+    }
+
+    #[test]
+    fn test_chunk_clean_text() {
+        let chunks = chunk_markdown("**bold** and *italic*");
+        assert_eq!(chunks[0].text, "bold and italic");
+    }
+
+    #[test]
+    fn test_chunk_link_text() {
+        let chunks = chunk_markdown("[text](https://example.com)");
+        assert_eq!(chunks[0].text, "text");
+    }
+
+    #[test]
+    fn test_chunk_source_lines() {
+        let input = "# Title\n\nParagraph here";
+        let chunks = chunk_markdown(input);
+        assert_eq!(chunks[0].source_line_start, 1);
+        assert!(chunks[1].source_line_start >= 3);
+    }
+
+    #[test]
+    fn test_chunk_html_comments_dropped() {
+        let input = "First paragraph\n\n<!-- Page 1 - 2 images -->\n\nSecond paragraph";
+        let chunks = chunk_markdown(input);
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"First paragraph"));
+        assert!(texts.contains(&"Second paragraph"));
+        assert!(!texts.iter().any(|t| t.contains("Page 1")));
+    }
+
+    #[test]
+    fn test_chunk_unicode() {
+        let chunks = chunk_markdown("namaḥ śivāya");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "namaḥ śivāya");
+    }
+
+    #[test]
+    fn test_chunk_empty() {
+        let chunks = chunk_markdown("");
+        assert!(chunks.is_empty());
+        let chunks2 = chunk_markdown("   \n  \n  ");
+        assert!(chunks2.is_empty());
+    }
+
+    // -- chunk_document / chunk_pages -----------------------------------------
+
+    #[test]
+    fn test_chunk_document_basic() {
+        let chunks = chunk_document("# Hello\n\nWorld");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Heading);
+        assert_eq!(chunks[1].chunk_type, ChunkType::Paragraph);
+    }
+
+    #[test]
+    fn test_chunk_document_with_page_markers() {
+        let input = "<!-- Page 1 - 2 images -->\n# Title\n\nContent\n\n<!-- Page 2 - 1 image -->\n\nMore content";
+        let chunks = chunk_document(input);
+        // Page markers should be silently dropped
+        assert!(!chunks.iter().any(|c| c.text.contains("Page 1")));
+        assert!(chunks.iter().any(|c| c.text == "Title"));
+        assert!(chunks.iter().any(|c| c.text == "Content"));
+    }
+
+    #[test]
+    fn test_chunk_pages_basic() {
+        let pages = parse_pages(SAMPLE).unwrap();
+        let chunks = chunk_pages(&pages);
+        assert!(!chunks.is_empty());
+        // All chunks should have page_number set
+        assert!(chunks.iter().all(|c| c.page_number.is_some()));
+    }
+
+    #[test]
+    fn test_chunk_pages_heading_isolation() {
+        let input = "<!-- Page 1 - 1 image -->\n# Chapter 1\n\nContent A\n\n<!-- Page 2 - 1 image -->\nContent B";
+        let pages = parse_pages(input).unwrap();
+        let chunks = chunk_pages(&pages);
+        let content_b = chunks.iter().find(|c| c.text == "Content B").unwrap();
+        // Heading from page 1 should NOT bleed into page 2
+        assert!(content_b.heading_context.is_empty());
+    }
+
+    // -- chunks_to_json / format_chunks_table ---------------------------------
+
+    #[test]
+    fn test_chunks_json_valid() {
+        let chunks = chunk_document("# Hello\n\nWorld");
+        let json_str = chunks_to_json(&chunks, "document");
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["total_chunks"], 2);
+        assert_eq!(v["mode"], "document");
+        assert_eq!(v["chunks"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_format_chunks_table() {
+        let chunks = chunk_document("# Hello\n\nWorld");
+        let table = format_chunks_table(&chunks);
+        assert!(table.contains("Type"));
+        assert!(table.contains("heading"));
+        assert!(table.contains("paragraph"));
+        assert!(table.contains("Total: 2 chunks"));
     }
 
     // -- raw_lines / raw_lines_sans_marker ------------------------------------

@@ -55,6 +55,14 @@ pub enum Commands {
         #[arg(long)]
         outdir: PathBuf,
     },
+    /// Chunk markdown into structural segments for embedding
+    Chunks {
+        /// Input file path, or "-" for stdin
+        file: String,
+        /// Chunk per page (requires page markers) instead of whole document
+        #[arg(long)]
+        per_page: bool,
+    },
     /// Start MCP (Model Context Protocol) server over stdio
     Mcp,
 }
@@ -88,12 +96,36 @@ fn run() -> Result<(), ChunkerError> {
         return Ok(());
     }
 
+    if let Commands::Chunks { ref file, per_page } = cli.command {
+        let content = read_input(file)?;
+        if per_page {
+            let pages = parse_pages(&content)?;
+            let chunks = chunk_pages(&pages);
+            if cli.json {
+                println!("{}", chunks_to_json(&chunks, "per_page"));
+            } else {
+                print!("{}", format_chunks_table(&chunks));
+            }
+        } else {
+            if content.trim().is_empty() {
+                return Err(ChunkerError::EmptyFile);
+            }
+            let chunks = chunk_document(&content);
+            if cli.json {
+                println!("{}", chunks_to_json(&chunks, "document"));
+            } else {
+                print!("{}", format_chunks_table(&chunks));
+            }
+        }
+        return Ok(());
+    }
+
     let file = match &cli.command {
         Commands::Pages { file }
         | Commands::Lines { file, .. }
         | Commands::Search { file, .. }
         | Commands::Split { file, .. } => file.as_str(),
-        Commands::Mcp => unreachable!(),
+        Commands::Mcp | Commands::Chunks { .. } => unreachable!(),
     };
     let content = read_input(file)?;
     let pages = parse_pages(&content)?;
@@ -153,7 +185,7 @@ fn run() -> Result<(), ChunkerError> {
                 );
             }
         }
-        Commands::Mcp => unreachable!(),
+        Commands::Mcp | Commands::Chunks { .. } => unreachable!(),
     }
 
     Ok(())

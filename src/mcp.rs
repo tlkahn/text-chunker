@@ -1,5 +1,6 @@
 use crate::{
-    ChunkerError, LineMode, collect_page_lines, lines_to_json, pages_to_json, parse_page_range,
+    ChunkerError, LineMode, chunk_document, chunk_pages, chunks_to_json,
+    collect_page_lines, lines_to_json, pages_to_json, parse_page_range,
     parse_pages, search_pages, search_to_json, split_pages, validate_extension,
 };
 use serde::Serialize;
@@ -70,6 +71,20 @@ pub fn handle_split_content(content: &str, outdir: &str) -> Result<String, Chunk
     Ok(serde_json::to_string_pretty(&result).unwrap())
 }
 
+pub fn handle_chunks_content(content: &str, per_page: bool) -> Result<String, ChunkerError> {
+    if content.trim().is_empty() {
+        return Err(ChunkerError::EmptyFile);
+    }
+    if per_page {
+        let pages = parse_pages(content)?;
+        let chunks = chunk_pages(&pages);
+        Ok(chunks_to_json(&chunks, "per_page"))
+    } else {
+        let chunks = chunk_document(content);
+        Ok(chunks_to_json(&chunks, "document"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // File-reading wrappers
 // ---------------------------------------------------------------------------
@@ -96,6 +111,12 @@ pub fn handle_split(file: &str, outdir: &str) -> Result<String, ChunkerError> {
     validate_extension(file)?;
     let content = std::fs::read_to_string(file)?;
     handle_split_content(&content, outdir)
+}
+
+pub fn handle_chunks(file: &str, per_page: bool) -> Result<String, ChunkerError> {
+    validate_extension(file)?;
+    let content = std::fs::read_to_string(file)?;
+    handle_chunks_content(&content, per_page)
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +153,14 @@ pub struct SplitInput {
     pub file: String,
     /// Output directory to write individual page files into (created if it doesn't exist)
     pub outdir: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChunksInput {
+    /// Path to a .md or .txt file
+    pub file: String,
+    /// If true, chunk per page (requires page markers). If false/omitted, chunk the whole document.
+    pub per_page: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -180,6 +209,17 @@ impl TextChunkerMcp {
         }
     }
 
+    #[tool(description = "Chunk a markdown document into structural segments (headings, paragraphs, list items, code blocks, tables, blockquotes) for embedding. Returns JSON with chunk text, type, heading context, and source line numbers. Use per_page=true to chunk within each page separately.")]
+    fn chunks(
+        &self,
+        Parameters(input): Parameters<ChunksInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match handle_chunks(&input.file, input.per_page.unwrap_or(false)) {
+            Ok(json) => Ok(CallToolResult::success(vec![Content::text(json)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),
+        }
+    }
+
     #[tool(description = "Split a page-marked document into individual page files. Each page is written as page-000.md, page-001.md, etc. Returns JSON with pages_written count and file list.")]
     fn split(
         &self,
@@ -201,9 +241,9 @@ impl ServerHandler for TextChunkerMcp {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "text-chunker: split and query page-marked manuscripts (<!-- Page N - M images -->). \
+                "text-chunker: split, query, and chunk page-marked manuscripts (<!-- Page N - M images -->). \
                  Use 'pages' to list all pages, 'lines' to read specific pages, 'search' to find text, \
-                 'split' to write individual page files.",
+                 'split' to write individual page files, 'chunks' to extract structural segments for embedding.",
             )
     }
 }
@@ -407,6 +447,41 @@ Third page only line";
     fn test_split_content_no_markers() {
         let dir = tempfile::tempdir().unwrap();
         let result = handle_split_content("just text", dir.path().to_str().unwrap());
+        assert!(matches!(result, Err(ChunkerError::NoPagesFound)));
+    }
+
+    // -- handle_chunks_content -----------------------------------------------
+
+    #[test]
+    fn test_handle_chunks_content_document() {
+        let json = handle_chunks_content("# Hello\n\nWorld", false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mode"], "document");
+        assert_eq!(v["total_chunks"], 2);
+        assert!(v["chunks"].as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn test_handle_chunks_content_per_page() {
+        let json = handle_chunks_content(SAMPLE, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["mode"], "per_page");
+        assert!(v["total_chunks"].as_u64().unwrap() > 0);
+        // All chunks should have page_number
+        for chunk in v["chunks"].as_array().unwrap() {
+            assert!(chunk["page_number"].is_number());
+        }
+    }
+
+    #[test]
+    fn test_handle_chunks_content_empty() {
+        let result = handle_chunks_content("", false);
+        assert!(matches!(result, Err(ChunkerError::EmptyFile)));
+    }
+
+    #[test]
+    fn test_handle_chunks_content_no_markers_per_page() {
+        let result = handle_chunks_content("just plain markdown\n\nno markers", true);
         assert!(matches!(result, Err(ChunkerError::NoPagesFound)));
     }
 }

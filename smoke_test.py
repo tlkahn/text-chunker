@@ -6,7 +6,7 @@
 """
 MCP Smoke Test -- Python Agent calling the text-chunker MCP server
 
-Exercises all four MCP tools (pages, lines, search, split) against a
+Exercises all five MCP tools (pages, lines, search, chunks, split) against a
 temporary fixture file with page markers.
 
 Usage:
@@ -64,6 +64,7 @@ TOOL_LABELS = {
     "pages": ("Listing pages", GREEN),
     "lines": ("Reading lines", CYAN),
     "search": ("Searching", YELLOW),
+    "chunks": ("Chunking", MAGENTA),
     "split": ("Splitting", MAGENTA),
 }
 
@@ -117,12 +118,13 @@ Available tools:
 - pages(file) -- list all pages with metadata
 - lines(file, page, mode?) -- get lines from a page or range
 - search(file, term) -- search for text across all pages
+- chunks(file, per_page?) -- chunk markdown into structural segments for embedding
 - split(file, outdir) -- split into individual page files
 
 The test document is at: {fixture_path}
 The output directory for split is: {split_dir}
 
-IMPORTANT: You must call ALL FOUR tools (pages, lines, search, split) to
+IMPORTANT: You must call ALL FIVE tools (pages, lines, search, chunks, split) to
 answer the user's question. Do not skip any tool calls.""",
             mcp_servers={
                 "text-chunker": {
@@ -140,7 +142,8 @@ answer the user's question. Do not skip any tool calls.""",
             "1) List all pages, "
             "2) Show the lines from page 1, "
             "3) Search for the word 'quick', "
-            f"4) Split the document into {split_dir}"
+            "4) Chunk the document into structural segments, "
+            f"5) Split the document into {split_dir}"
         )
 
         print(f"{BOLD}text-chunker MCP Smoke Test{RESET}")
@@ -168,13 +171,13 @@ answer the user's question. Do not skip any tool calls.""",
                 turns = message.num_turns
                 print(f"\n{DIM}  ({turns} turns, ${cost:.4f}){RESET}")
 
-        # Verify all four tools were exercised
-        expected = {"pages", "lines", "search", "split"}
+        # Verify all five tools were exercised
+        expected = {"pages", "lines", "search", "chunks", "split"}
         missing = expected - tools_called
         if missing:
             print(f"\n{BOLD}FAIL:{RESET} Tools not called: {missing}")
         else:
-            print(f"\n{GREEN}{BOLD}PASS:{RESET} All four tools exercised ({', '.join(sorted(tools_called))})")
+            print(f"\n{GREEN}{BOLD}PASS:{RESET} All five tools exercised ({', '.join(sorted(tools_called))})")
 
     finally:
         os.unlink(fixture_path)
