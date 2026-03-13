@@ -197,12 +197,14 @@ npx @modelcontextprotocol/inspector cargo run --release -- mcp
 
 ### Smoke test
 
-A Python smoke test exercises all five tools via the Claude Agent SDK:
-
 ```bash
 cargo build --release
 uv run smoke_test.py
 ```
+
+**Phase 1 (CLI)** — always runs, no API key needed. Invokes all five subcommands (`pages`, `lines`, `search`, `chunks`, `split`) via `subprocess` and validates output, including GFM/Obsidian extension handling (math, footnotes, task lists, wikilinks, definition lists, highlight/comment/block-anchor stripping).
+
+**Phase 2 (MCP)** — runs only when `ANTHROPIC_API_KEY` is set. A Python agent (Claude Agent SDK) calls all five MCP tools over stdio and verifies each was exercised.
 
 ## Testing
 
