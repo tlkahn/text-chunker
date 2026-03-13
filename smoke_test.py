@@ -47,17 +47,36 @@ BINARY = os.path.join(
 )
 
 FIXTURE = """\
+---
+title: Smoke Test Document
+tags: [test, mcp]
+---
+
 <!-- Page 0 - 2 images -->
 The quick brown fox jumps over the lazy dog.
 This is the first page of our test document.
+
+The equation $E = mc^2$ is famous[^1].
+
+[^1]: Einstein's mass-energy equivalence.
 
 <!-- Page 1 - 1 image -->
 Pack my box with five dozen liquor jugs.
 Sphinx of black quartz, judge my vow.
 
+- [ ] unchecked task
+- [x] checked task
+
+See [[Related Page]] for more details.
+
 <!-- Page 2 - 3 images -->
-How vexingly quick daft zebras jump.
+How vexingly quick daft zebras jump. %%hidden comment%%
 The five boxing wizards jump quickly.
+
+Term One
+:   Definition of term one
+
+This has ==highlighted text== inside. ^block-anchor
 """
 
 TOOL_LABELS = {
@@ -142,7 +161,9 @@ answer the user's question. Do not skip any tool calls.""",
             "1) List all pages, "
             "2) Show the lines from page 1, "
             "3) Search for the word 'quick', "
-            "4) Chunk the document into structural segments, "
+            "4) Chunk the document into structural segments (check that math, footnotes, "
+            "task lists, wikilinks, definition items, and Obsidian syntax are handled correctly "
+            "-- frontmatter/comments/highlights/block-anchors should be stripped, text preserved), "
             f"5) Split the document into {split_dir}"
         )
 

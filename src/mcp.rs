@@ -209,7 +209,7 @@ impl TextChunkerMcp {
         }
     }
 
-    #[tool(description = "Chunk a markdown document into structural segments (headings, paragraphs, list items, code blocks, tables, blockquotes) for embedding. Returns JSON with chunk text, type, heading context, and source line numbers. Use per_page=true to chunk within each page separately.")]
+    #[tool(description = "Chunk a markdown document into structural segments (headings, paragraphs, list items, code blocks, tables, blockquotes, definition items) for embedding. Supports GFM extensions, math, footnotes, task lists, wikilinks, and Obsidian syntax. Returns JSON with chunk text, type, heading context, and source line numbers. Use per_page=true to chunk within each page separately.")]
     fn chunks(
         &self,
         Parameters(input): Parameters<ChunksInput>,

@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use serde::Serialize;
 use thiserror::Error;
@@ -382,6 +382,7 @@ pub enum ChunkType {
     CodeBlock,
     Table,
     BlockQuote,
+    DefinitionItem,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -417,6 +418,23 @@ pub fn byte_offset_to_line(index: &[usize], offset: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Obsidian pre-processing
+// ---------------------------------------------------------------------------
+
+pub fn preprocess_obsidian(content: &str) -> String {
+    let re_comment = Regex::new(r"%%[\s\S]*?%%").unwrap();
+    let result = re_comment.replace_all(content, "");
+    let re_highlight = Regex::new(r"==([^=]+)==").unwrap();
+    let result = re_highlight.replace_all(&result, "$1");
+    // Strip #^block-ref from wikilinks: [[Page#^foo]] → [[Page]], [[Page#^foo|text]] unchanged
+    let re_block_ref = Regex::new(r"\[\[([^\]|]+?)#\^[a-zA-Z0-9_-]+\]\]").unwrap();
+    let result = re_block_ref.replace_all(&result, "[[$1]]");
+    // Strip ^block-id anchors at end of line (space + ^identifier)
+    let re_anchor = Regex::new(r"(?m) \^[a-zA-Z0-9_-]+$").unwrap();
+    re_anchor.replace_all(&result, "").into_owned()
+}
+
+// ---------------------------------------------------------------------------
 // Core chunking algorithm
 // ---------------------------------------------------------------------------
 
@@ -425,15 +443,23 @@ pub fn chunk_markdown(content: &str) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    let line_index = build_line_index(content);
+    let content = preprocess_obsidian(content);
+    let line_index = build_line_index(&content);
 
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    opts.insert(Options::ENABLE_GFM);
+    opts.insert(Options::ENABLE_DEFINITION_LIST);
+    opts.insert(Options::ENABLE_WIKILINKS);
 
-    let parser = Parser::new_ext(content, opts).into_offset_iter();
+    let parser = Parser::new_ext(&content, opts).into_offset_iter();
 
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut heading_stack: Vec<(u8, String)> = Vec::new();
@@ -446,10 +472,15 @@ pub fn chunk_markdown(content: &str) -> Vec<Chunk> {
     let mut block_end_offset: usize = 0;
     let mut current_heading_level: Option<u8> = None;
 
-    // Nesting depth for list items and blockquotes
+    // Nesting depth for list items, blockquotes, footnotes, and definitions
     let mut item_depth: usize = 0;
     let mut blockquote_depth: usize = 0;
     let mut _list_depth: usize = 0;
+    let mut footnote_depth: usize = 0;
+    let mut in_frontmatter = false;
+    let mut def_title_buf = String::new();
+    let mut def_depth: usize = 0;
+    let mut def_start_offset: usize = 0;
 
     for (event, range) in parser {
         match event {
@@ -483,15 +514,15 @@ pub fn chunk_markdown(content: &str) -> Vec<Chunk> {
                 text_buf.clear();
             }
             Event::Start(Tag::Paragraph) => {
-                if item_depth == 0 && blockquote_depth == 0 {
+                if item_depth == 0 && blockquote_depth == 0 && footnote_depth == 0 && def_depth == 0 {
                     block_type = Some(ChunkType::Paragraph);
                     text_buf.clear();
                     block_start_offset = range.start;
                 }
-                // Inside items/blockquotes, paragraph text just accumulates
+                // Inside items/blockquotes/footnotes/definitions, paragraph text just accumulates
             }
             Event::End(TagEnd::Paragraph) => {
-                if item_depth == 0 && blockquote_depth == 0 {
+                if item_depth == 0 && blockquote_depth == 0 && footnote_depth == 0 && def_depth == 0 {
                     block_end_offset = range.end;
                     let text = text_buf.trim().to_string();
                     if !text.is_empty() {
@@ -613,6 +644,93 @@ pub fn chunk_markdown(content: &str) -> Vec<Chunk> {
                 }
                 blockquote_depth = blockquote_depth.saturating_sub(1);
             }
+            // Footnote handling
+            Event::Start(Tag::FootnoteDefinition(_)) => {
+                footnote_depth += 1;
+                if footnote_depth == 1 {
+                    text_buf.clear();
+                    block_start_offset = range.start;
+                }
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                if footnote_depth == 1 {
+                    block_end_offset = range.end;
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        chunks.push(Chunk {
+                            text,
+                            chunk_type: ChunkType::Paragraph,
+                            heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                            heading_level: None,
+                            page_number: None,
+                            source_line_start: byte_offset_to_line(&line_index, block_start_offset),
+                            source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(block_start_offset)),
+                        });
+                    }
+                    block_type = None;
+                    text_buf.clear();
+                }
+                footnote_depth = footnote_depth.saturating_sub(1);
+            }
+            Event::FootnoteReference(label) => {
+                text_buf.push_str("[^");
+                text_buf.push_str(&label);
+                text_buf.push(']');
+            }
+            // Math handling
+            Event::InlineMath(text) => {
+                text_buf.push_str(&text);
+            }
+            Event::DisplayMath(text) => {
+                text_buf.push_str(&text);
+            }
+            // Task list handling
+            Event::TaskListMarker(checked) => {
+                text_buf.push_str(if checked { "[x] " } else { "[ ] " });
+            }
+            // Frontmatter handling — drop silently
+            Event::Start(Tag::MetadataBlock(MetadataBlockKind::YamlStyle | MetadataBlockKind::PlusesStyle)) => {
+                in_frontmatter = true;
+            }
+            Event::End(TagEnd::MetadataBlock(_)) => {
+                in_frontmatter = false;
+                text_buf.clear();
+            }
+            // Definition list handling
+            Event::Start(Tag::DefinitionList) | Event::End(TagEnd::DefinitionList) => {}
+            Event::Start(Tag::DefinitionListTitle) => {
+                def_depth += 1;
+                def_title_buf.clear();
+                text_buf.clear();
+                def_start_offset = range.start;
+            }
+            Event::End(TagEnd::DefinitionListTitle) => {
+                def_title_buf = text_buf.trim().to_string();
+                text_buf.clear();
+                def_depth = def_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::DefinitionListDefinition) => {
+                def_depth += 1;
+                text_buf.clear();
+            }
+            Event::End(TagEnd::DefinitionListDefinition) => {
+                block_end_offset = range.end;
+                let def_text = text_buf.trim().to_string();
+                if !def_title_buf.is_empty() || !def_text.is_empty() {
+                    let combined = format!("{}: {}", def_title_buf, def_text);
+                    chunks.push(Chunk {
+                        text: combined,
+                        chunk_type: ChunkType::DefinitionItem,
+                        heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: byte_offset_to_line(&line_index, def_start_offset),
+                        source_line_end: byte_offset_to_line(&line_index, block_end_offset.saturating_sub(1).max(def_start_offset)),
+                    });
+                }
+                text_buf.clear();
+                def_depth = def_depth.saturating_sub(1);
+            }
             // Table cell separators
             Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
                 if block_type == Some(ChunkType::Table) {
@@ -626,7 +744,9 @@ pub fn chunk_markdown(content: &str) -> Vec<Chunk> {
             }
             // Text content events
             Event::Text(text) => {
-                text_buf.push_str(&text);
+                if !in_frontmatter {
+                    text_buf.push_str(&text);
+                }
             }
             Event::Code(code) => {
                 text_buf.push_str(&code);
@@ -703,6 +823,7 @@ pub fn format_chunks_table(chunks: &[Chunk]) -> String {
             ChunkType::CodeBlock => "code_block",
             ChunkType::Table => "table",
             ChunkType::BlockQuote => "block_quote",
+            ChunkType::DefinitionItem => "def_item",
         };
         let preview: String = chunk.text.chars().take(40).collect();
         let preview = preview.replace('\n', " ");
@@ -1497,5 +1618,184 @@ Third page only line";
         let result = collect_page_lines(&pages, 0, 0, LineMode::Content).unwrap();
         assert_eq!(result.line_start, 0);
         assert_eq!(result.line_end, 0);
+    }
+
+    // -- Phase A: Fix data loss bugs ------------------------------------------
+
+    #[test]
+    fn test_chunk_inline_math() {
+        let chunks = chunk_markdown("The equation $E = mc^2$ is famous");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("E = mc^2"));
+    }
+
+    #[test]
+    fn test_chunk_display_math() {
+        let chunks = chunk_markdown("$$\n\\sum_{i=1}^{n} i\n$$");
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().any(|c| c.text.contains("\\sum")));
+    }
+
+    #[test]
+    fn test_chunk_footnote_reference() {
+        let chunks = chunk_markdown("Main text[^1] here\n\n[^1]: The footnote text");
+        let main = chunks.iter().find(|c| c.text.contains("Main text")).unwrap();
+        assert!(main.text.contains("[^1]"));
+    }
+
+    #[test]
+    fn test_chunk_footnote_definition() {
+        let chunks = chunk_markdown("Main text[^1] here\n\n[^1]: The footnote text");
+        assert!(chunks.iter().any(|c| c.text.contains("The footnote text")));
+    }
+
+    // -- Phase B: Verify existing inline handling -----------------------------
+
+    #[test]
+    fn test_chunk_strikethrough() {
+        let chunks = chunk_markdown("This is ~~deleted~~ text");
+        assert_eq!(chunks[0].text, "This is deleted text");
+    }
+
+    // -- Phase C: New pulldown-cmark extensions -------------------------------
+
+    #[test]
+    fn test_chunk_task_list() {
+        let chunks = chunk_markdown("- [ ] unchecked\n- [x] checked");
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].text.starts_with("[ ] "));
+        assert!(items[1].text.starts_with("[x] "));
+    }
+
+    #[test]
+    fn test_chunk_smart_punctuation() {
+        let chunks = chunk_markdown("She said \"hello\" -- and left...");
+        let text = &chunks[0].text;
+        assert!(text.contains('\u{201c}') || text.contains('\u{201d}')); // smart quotes
+        assert!(text.contains('\u{2013}')); // en-dash
+    }
+
+    #[test]
+    fn test_chunk_heading_attributes() {
+        let chunks = chunk_markdown("# Title {#my-id .cls}");
+        assert_eq!(chunks[0].text, "Title");
+    }
+
+    #[test]
+    fn test_chunk_gfm_callout() {
+        let chunks = chunk_markdown("> [!NOTE]\n> This is a note");
+        let bq = chunks.iter().find(|c| c.chunk_type == ChunkType::BlockQuote).unwrap();
+        assert!(bq.text.contains("This is a note"));
+    }
+
+    #[test]
+    fn test_chunk_wikilink_simple() {
+        let chunks = chunk_markdown("See [[Some Page]] for details");
+        let text = &chunks[0].text;
+        assert!(text.contains("Some Page"));
+        assert!(!text.contains("[["));
+    }
+
+    #[test]
+    fn test_chunk_wikilink_piped() {
+        let chunks = chunk_markdown("See [[Page|display text]] for details");
+        let text = &chunks[0].text;
+        assert!(text.contains("display text"));
+    }
+
+    // -- Phase D: Definition lists --------------------------------------------
+
+    #[test]
+    fn test_chunk_definition_list() {
+        let chunks = chunk_markdown("Term 1\n:   Definition 1\n\nTerm 2\n:   Definition 2");
+        let defs: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::DefinitionItem).collect();
+        assert_eq!(defs.len(), 2);
+        assert!(defs[0].text.contains("Term 1"));
+        assert!(defs[0].text.contains("Definition 1"));
+        assert!(defs[1].text.contains("Term 2"));
+        assert!(defs[1].text.contains("Definition 2"));
+    }
+
+    #[test]
+    fn test_chunk_definition_list_json() {
+        let chunks = chunk_markdown("Term\n:   Definition");
+        let json_str = chunks_to_json(&chunks, "document");
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let chunk_types: Vec<&str> = v["chunks"].as_array().unwrap()
+            .iter()
+            .map(|c| c["chunk_type"].as_str().unwrap())
+            .collect();
+        assert!(chunk_types.contains(&"definition_item"));
+    }
+
+    // -- Phase E: Frontmatter -------------------------------------------------
+
+    #[test]
+    fn test_chunk_frontmatter_dropped() {
+        let chunks = chunk_markdown("---\ntitle: X\ntags: [a, b]\n---\n\n# Heading\n\nContent");
+        assert!(!chunks.iter().any(|c| c.text.contains("title:")));
+        assert!(chunks.iter().any(|c| c.text == "Heading"));
+        assert!(chunks.iter().any(|c| c.text == "Content"));
+    }
+
+    // -- Phase F: Obsidian pre-processing -------------------------------------
+
+    #[test]
+    fn test_chunk_obsidian_comment_stripped() {
+        let chunks = chunk_markdown("Before %%hidden%% after");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("Before"));
+        assert!(chunks[0].text.contains("after"));
+        assert!(!chunks[0].text.contains("hidden"));
+    }
+
+    #[test]
+    fn test_chunk_obsidian_comment_multiline() {
+        let chunks = chunk_markdown("Before\n\n%%\nmulti\nline\n%%\n\nAfter");
+        assert!(!chunks.iter().any(|c| c.text.contains("multi")));
+        assert!(chunks.iter().any(|c| c.text.contains("Before")));
+        assert!(chunks.iter().any(|c| c.text.contains("After")));
+    }
+
+    #[test]
+    fn test_chunk_obsidian_highlight_text_kept() {
+        let chunks = chunk_markdown("This has ==highlighted text== inside");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("highlighted text"));
+        assert!(!chunks[0].text.contains("=="));
+    }
+
+    #[test]
+    fn test_chunk_obsidian_block_anchor_stripped() {
+        let chunks = chunk_markdown("This is a paragraph ^block-id");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "This is a paragraph");
+    }
+
+    #[test]
+    fn test_chunk_obsidian_block_anchor_multiline() {
+        let chunks = chunk_markdown("First line\nSecond line ^my-ref\n\nAnother paragraph");
+        assert_eq!(chunks.len(), 2);
+        assert!(!chunks[0].text.contains("^my-ref"));
+        assert!(chunks[0].text.contains("Second line"));
+    }
+
+    #[test]
+    fn test_chunk_obsidian_block_ref_in_wikilink() {
+        // [[Page#^foo]] → preprocessed to [[Page]] → rendered as "Page"
+        let chunks = chunk_markdown("See [[Page#^block-id]] for details");
+        let text = &chunks[0].text;
+        assert!(text.contains("Page"));
+        assert!(!text.contains("^block-id"));
+        assert!(!text.contains("#^"));
+    }
+
+    #[test]
+    fn test_chunk_obsidian_block_ref_piped_wikilink_unchanged() {
+        // [[Page#^foo|display]] — piped wikilinks keep display text as-is
+        let chunks = chunk_markdown("See [[Page#^foo|display text]] for details");
+        let text = &chunks[0].text;
+        assert!(text.contains("display text"));
     }
 }
