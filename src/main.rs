@@ -55,9 +55,9 @@ pub enum Commands {
         #[arg(long)]
         outdir: PathBuf,
     },
-    /// Chunk markdown into structural segments for embedding
+    /// Chunk markdown or LaTeX into structural segments for embedding
     Chunks {
-        /// Input file path, or "-" for stdin
+        /// Input file path (.md, .txt, .tex), or "-" for stdin
         file: String,
         /// Chunk per page (requires page markers) instead of whole document
         #[arg(long)]
@@ -98,9 +98,10 @@ fn run() -> Result<(), ChunkerError> {
 
     if let Commands::Chunks { ref file, per_page } = cli.command {
         let content = read_input(file)?;
+        let format = detect_format(file);
         if per_page {
             let pages = parse_pages(&content)?;
-            let chunks = chunk_pages(&pages);
+            let chunks = chunk_pages_fmt(&pages, format);
             if cli.json {
                 println!("{}", chunks_to_json(&chunks, "per_page"));
             } else {
@@ -110,7 +111,7 @@ fn run() -> Result<(), ChunkerError> {
             if content.trim().is_empty() {
                 return Err(ChunkerError::EmptyFile);
             }
-            let chunks = chunk_document(&content);
+            let chunks = chunk_document_fmt(&content, format);
             if cli.json {
                 println!("{}", chunks_to_json(&chunks, "document"));
             } else {

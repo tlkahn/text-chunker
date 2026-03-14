@@ -1,6 +1,7 @@
 use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use serde::Serialize;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 pub mod mcp;
@@ -383,6 +384,8 @@ pub enum ChunkType {
     Table,
     BlockQuote,
     DefinitionItem,
+    MathBlock,
+    Theorem,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -824,6 +827,8 @@ pub fn format_chunks_table(chunks: &[Chunk]) -> String {
             ChunkType::Table => "table",
             ChunkType::BlockQuote => "block_quote",
             ChunkType::DefinitionItem => "def_item",
+            ChunkType::MathBlock => "math_block",
+            ChunkType::Theorem => "theorem",
         };
         let preview: String = chunk.text.chars().take(40).collect();
         let preview = preview.replace('\n', " ");
@@ -849,10 +854,958 @@ pub fn format_chunks_table(chunks: &[Chunk]) -> String {
 pub fn validate_extension(path: &str) -> Result<(), ChunkerError> {
     let p = std::path::Path::new(path);
     match p.extension().and_then(|e| e.to_str()) {
-        Some("md" | "txt") => Ok(()),
+        Some("md" | "txt" | "tex") => Ok(()),
         Some(ext) => Err(ChunkerError::UnsupportedExtension(ext.to_string())),
         None => Err(ChunkerError::UnsupportedExtension("(none)".to_string())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Format detection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Markdown,
+    Latex,
+}
+
+pub fn detect_format(path: &str) -> Format {
+    match std::path::Path::new(path).extension().and_then(|e| e.to_str()) {
+        Some("tex") => Format::Latex,
+        _ => Format::Markdown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LaTeX chunking
+// ---------------------------------------------------------------------------
+
+struct LatexRegexes {
+    section: Regex,
+    begin_env: Regex,
+    end_env: Regex,
+    item: Regex,
+    inline_fmt: Regex,
+    label: Regex,
+    caption: Regex,
+    includegraphics: Regex,
+}
+
+fn latex_regexes() -> &'static LatexRegexes {
+    static REGEXES: OnceLock<LatexRegexes> = OnceLock::new();
+    REGEXES.get_or_init(|| LatexRegexes {
+        section: Regex::new(
+            r"^\\(part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\{([^}]*)\}"
+        ).unwrap(),
+        begin_env: Regex::new(r"\\begin\{([^}]+)\}").unwrap(),
+        end_env: Regex::new(r"\\end\{([^}]+)\}").unwrap(),
+        item: Regex::new(r"^\\item(?:\[([^\]]*)\])?\s*(.*)").unwrap(),
+        inline_fmt: Regex::new(
+            r"\\(?:textbf|textit|emph|underline|textsc|textrm|texttt)\{([^}]*)\}"
+        ).unwrap(),
+        label: Regex::new(r"\\label\{[^}]*\}").unwrap(),
+        caption: Regex::new(r"\\caption\{([^}]*)\}").unwrap(),
+        includegraphics: Regex::new(r"\\includegraphics(?:\[[^\]]*\])?\{[^}]*\}").unwrap(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvKind {
+    Verbatim,
+    Math,
+    Theorem,
+    Table,
+    Quote,
+    List,
+    Abstract,
+    Unknown,
+}
+
+fn classify_env(name: &str) -> EnvKind {
+    match name {
+        "verbatim" | "lstlisting" | "minted" => EnvKind::Verbatim,
+        "equation" | "equation*" | "align" | "align*" | "gather" | "gather*"
+        | "multline" | "multline*" | "displaymath" => EnvKind::Math,
+        "theorem" | "lemma" | "proof" | "proposition" | "corollary"
+        | "definition" | "remark" | "example" | "conjecture" | "claim" => EnvKind::Theorem,
+        "tabular" | "table" | "table*" => EnvKind::Table,
+        "quote" | "quotation" => EnvKind::Quote,
+        "itemize" | "enumerate" | "description" => EnvKind::List,
+        "abstract" => EnvKind::Abstract,
+        _ => EnvKind::Unknown,
+    }
+}
+
+fn section_level(cmd: &str) -> u8 {
+    match cmd {
+        "part" | "chapter" => 1,
+        "section" => 2,
+        "subsection" => 3,
+        "subsubsection" => 4,
+        "paragraph" => 5,
+        "subparagraph" => 6,
+        _ => 2,
+    }
+}
+
+fn strip_latex_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'%' && (i == 0 || bytes[i - 1] != b'\\') {
+            return &line[..i];
+        }
+    }
+    line
+}
+
+fn clean_latex_inline(text: &str, re: &LatexRegexes) -> String {
+    let result = text.replace('~', " ");
+    let result = re.label.replace_all(&result, "");
+    let result = re.includegraphics.replace_all(&result, "");
+    let result = re.caption.replace_all(&result, "$1");
+    let mut result = result.into_owned();
+    loop {
+        let new = re.inline_fmt.replace_all(&result, "$1");
+        if new == result {
+            break;
+        }
+        result = new.into_owned();
+    }
+    result.replace(r"\%", "%")
+}
+
+#[derive(Debug, Clone)]
+enum LatexState {
+    Normal,
+    Verbatim { env: String, depth: usize },
+    Math { env: String, depth: usize },
+    DollarMath,
+    BracketMath,
+    Theorem { env: String, depth: usize },
+    Table { env: String, depth: usize },
+    Quote { env: String, depth: usize },
+    List { env: String, depth: usize },
+}
+
+fn flush_latex_paragraph(
+    chunks: &mut Vec<Chunk>,
+    text_buf: &mut String,
+    heading_stack: &[(u8, String)],
+    start_line: usize,
+    end_line: usize,
+    re: &LatexRegexes,
+) {
+    let text = text_buf.trim().to_string();
+    if !text.is_empty() {
+        let text = clean_latex_inline(&text, re);
+        let text = text.trim().to_string();
+        if !text.is_empty() {
+            chunks.push(Chunk {
+                text,
+                chunk_type: ChunkType::Paragraph,
+                heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                heading_level: None,
+                page_number: None,
+                source_line_start: start_line,
+                source_line_end: end_line.max(start_line),
+            });
+        }
+    }
+    text_buf.clear();
+}
+
+pub fn chunk_latex(content: &str) -> Vec<Chunk> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let re = latex_regexes();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Handle preamble: find \begin{document} and \end{document}
+    let mut start_idx = 0;
+    let mut end_idx = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == r"\begin{document}" {
+            start_idx = i + 1;
+        }
+        if trimmed == r"\end{document}" {
+            end_idx = i;
+        }
+    }
+
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut heading_stack: Vec<(u8, String)> = Vec::new();
+    let mut state = LatexState::Normal;
+    let mut text_buf = String::new();
+    let mut block_start_line: usize = 1;
+    let mut item_text_buf = String::new();
+    let mut item_start_line: usize = 1;
+
+    for line_idx in start_idx..end_idx {
+        let line_num = line_idx + 1; // 1-based
+        let raw_line = lines[line_idx];
+
+        // --- Verbatim state: no processing, collect raw lines ---
+        if let LatexState::Verbatim { ref env, depth } = state.clone() {
+            let trimmed = raw_line.trim();
+            let mut new_depth = depth;
+            if let Some(caps) = re.begin_env.captures(trimmed) {
+                if caps.get(1).unwrap().as_str() == env {
+                    new_depth += 1;
+                }
+            }
+            if let Some(caps) = re.end_env.captures(trimmed) {
+                if caps.get(1).unwrap().as_str() == env {
+                    new_depth -= 1;
+                    if new_depth == 0 {
+                        let text = text_buf.trim().to_string();
+                        if !text.is_empty() {
+                            chunks.push(Chunk {
+                                text,
+                                chunk_type: ChunkType::CodeBlock,
+                                heading_context: heading_stack
+                                    .iter()
+                                    .map(|(_, s)| s.clone())
+                                    .collect(),
+                                heading_level: None,
+                                page_number: None,
+                                source_line_start: block_start_line,
+                                source_line_end: line_num,
+                            });
+                        }
+                        text_buf.clear();
+                        state = LatexState::Normal;
+                        continue;
+                    }
+                }
+            }
+            state = LatexState::Verbatim {
+                env: env.clone(),
+                depth: new_depth,
+            };
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(raw_line);
+            continue;
+        }
+
+        // Strip comments for all non-verbatim states
+        let line = strip_latex_comment(raw_line);
+        let trimmed = line.trim();
+
+        // --- DollarMath state: collecting $$ ... $$ ---
+        if matches!(state, LatexState::DollarMath) {
+            if trimmed == "$$" || trimmed.ends_with("$$") {
+                // Accumulate any content before the closing $$
+                let before = if trimmed == "$$" {
+                    ""
+                } else {
+                    &trimmed[..trimmed.len() - 2]
+                };
+                if !before.trim().is_empty() {
+                    if !text_buf.is_empty() {
+                        text_buf.push('\n');
+                    }
+                    text_buf.push_str(before.trim());
+                }
+                let text = text_buf.trim().to_string();
+                if !text.is_empty() {
+                    chunks.push(Chunk {
+                        text,
+                        chunk_type: ChunkType::MathBlock,
+                        heading_context: heading_stack
+                            .iter()
+                            .map(|(_, s)| s.clone())
+                            .collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: block_start_line,
+                        source_line_end: line_num,
+                    });
+                }
+                text_buf.clear();
+                state = LatexState::Normal;
+                continue;
+            }
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(trimmed);
+            continue;
+        }
+
+        // --- BracketMath state: collecting \[ ... \] ---
+        if matches!(state, LatexState::BracketMath) {
+            if trimmed == r"\]" || trimmed.ends_with(r"\]") {
+                let before = if trimmed == r"\]" {
+                    ""
+                } else {
+                    &trimmed[..trimmed.len() - 2]
+                };
+                if !before.trim().is_empty() {
+                    if !text_buf.is_empty() {
+                        text_buf.push('\n');
+                    }
+                    text_buf.push_str(before.trim());
+                }
+                let text = text_buf.trim().to_string();
+                if !text.is_empty() {
+                    chunks.push(Chunk {
+                        text,
+                        chunk_type: ChunkType::MathBlock,
+                        heading_context: heading_stack
+                            .iter()
+                            .map(|(_, s)| s.clone())
+                            .collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: block_start_line,
+                        source_line_end: line_num,
+                    });
+                }
+                text_buf.clear();
+                state = LatexState::Normal;
+                continue;
+            }
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(trimmed);
+            continue;
+        }
+
+        // --- Math env state ---
+        if let LatexState::Math { ref env, depth } = state.clone() {
+            let mut new_depth = depth;
+            if re.begin_env.is_match(trimmed) {
+                new_depth += 1;
+            }
+            if re.end_env.is_match(trimmed) {
+                new_depth -= 1;
+                if new_depth == 0 {
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        chunks.push(Chunk {
+                            text,
+                            chunk_type: ChunkType::MathBlock,
+                            heading_context: heading_stack
+                                .iter()
+                                .map(|(_, s)| s.clone())
+                                .collect(),
+                            heading_level: None,
+                            page_number: None,
+                            source_line_start: block_start_line,
+                            source_line_end: line_num,
+                        });
+                    }
+                    text_buf.clear();
+                    state = LatexState::Normal;
+                    continue;
+                }
+            }
+            state = LatexState::Math {
+                env: env.clone(),
+                depth: new_depth,
+            };
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(trimmed);
+            continue;
+        }
+
+        // --- Theorem env state ---
+        if let LatexState::Theorem { ref env, depth } = state.clone() {
+            let mut new_depth = depth;
+            if re.begin_env.is_match(trimmed) {
+                new_depth += 1;
+            }
+            if re.end_env.is_match(trimmed) {
+                new_depth -= 1;
+                if new_depth == 0 {
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        let text = clean_latex_inline(&text, re);
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            chunks.push(Chunk {
+                                text,
+                                chunk_type: ChunkType::Theorem,
+                                heading_context: heading_stack
+                                    .iter()
+                                    .map(|(_, s)| s.clone())
+                                    .collect(),
+                                heading_level: None,
+                                page_number: None,
+                                source_line_start: block_start_line,
+                                source_line_end: line_num,
+                            });
+                        }
+                    }
+                    text_buf.clear();
+                    state = LatexState::Normal;
+                    continue;
+                }
+            }
+            state = LatexState::Theorem {
+                env: env.clone(),
+                depth: new_depth,
+            };
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(trimmed);
+            continue;
+        }
+
+        // --- Table env state ---
+        if let LatexState::Table { ref env, depth } = state.clone() {
+            let mut new_depth = depth;
+            if re.begin_env.is_match(trimmed) {
+                new_depth += 1;
+            }
+            if re.end_env.is_match(trimmed) {
+                new_depth -= 1;
+                if new_depth == 0 {
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        chunks.push(Chunk {
+                            text,
+                            chunk_type: ChunkType::Table,
+                            heading_context: heading_stack
+                                .iter()
+                                .map(|(_, s)| s.clone())
+                                .collect(),
+                            heading_level: None,
+                            page_number: None,
+                            source_line_start: block_start_line,
+                            source_line_end: line_num,
+                        });
+                    }
+                    text_buf.clear();
+                    state = LatexState::Normal;
+                    continue;
+                }
+            }
+            state = LatexState::Table {
+                env: env.clone(),
+                depth: new_depth,
+            };
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(trimmed);
+            continue;
+        }
+
+        // --- Quote env state ---
+        if let LatexState::Quote { ref env, depth } = state.clone() {
+            let mut new_depth = depth;
+            if re.begin_env.is_match(trimmed) {
+                new_depth += 1;
+            }
+            if re.end_env.is_match(trimmed) {
+                new_depth -= 1;
+                if new_depth == 0 {
+                    let text = text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        let text = clean_latex_inline(&text, re);
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            chunks.push(Chunk {
+                                text,
+                                chunk_type: ChunkType::BlockQuote,
+                                heading_context: heading_stack
+                                    .iter()
+                                    .map(|(_, s)| s.clone())
+                                    .collect(),
+                                heading_level: None,
+                                page_number: None,
+                                source_line_start: block_start_line,
+                                source_line_end: line_num,
+                            });
+                        }
+                    }
+                    text_buf.clear();
+                    state = LatexState::Normal;
+                    continue;
+                }
+            }
+            state = LatexState::Quote {
+                env: env.clone(),
+                depth: new_depth,
+            };
+            if !text_buf.is_empty() {
+                text_buf.push('\n');
+            }
+            text_buf.push_str(trimmed);
+            continue;
+        }
+
+        // --- List env state ---
+        if let LatexState::List { ref env, depth } = state.clone() {
+            let mut new_depth = depth;
+
+            // Check for nested list begin
+            if let Some(caps) = re.begin_env.captures(trimmed) {
+                let name = caps.get(1).unwrap().as_str();
+                if matches!(classify_env(name), EnvKind::List) {
+                    new_depth += 1;
+                    state = LatexState::List {
+                        env: env.clone(),
+                        depth: new_depth,
+                    };
+                    continue;
+                }
+            }
+
+            // Check for list end
+            if let Some(caps) = re.end_env.captures(trimmed) {
+                let name = caps.get(1).unwrap().as_str();
+                if matches!(classify_env(name), EnvKind::List) {
+                    new_depth -= 1;
+                    if new_depth == 0 {
+                        // Flush last item
+                        let text = item_text_buf.trim().to_string();
+                        if !text.is_empty() {
+                            let text = clean_latex_inline(&text, re);
+                            let text = text.trim().to_string();
+                            if !text.is_empty() {
+                                chunks.push(Chunk {
+                                    text,
+                                    chunk_type: ChunkType::ListItem,
+                                    heading_context: heading_stack
+                                        .iter()
+                                        .map(|(_, s)| s.clone())
+                                        .collect(),
+                                    heading_level: None,
+                                    page_number: None,
+                                    source_line_start: item_start_line,
+                                    source_line_end: line_num
+                                        .saturating_sub(1)
+                                        .max(item_start_line),
+                                });
+                            }
+                        }
+                        item_text_buf.clear();
+                        state = LatexState::Normal;
+                        continue;
+                    }
+                    state = LatexState::List {
+                        env: env.clone(),
+                        depth: new_depth,
+                    };
+                    continue;
+                }
+            }
+
+            // Check for \item (only at top depth)
+            if new_depth == 1 {
+                if let Some(caps) = re.item.captures(trimmed) {
+                    // Flush previous item
+                    let text = item_text_buf.trim().to_string();
+                    if !text.is_empty() {
+                        let text = clean_latex_inline(&text, re);
+                        let text = text.trim().to_string();
+                        if !text.is_empty() {
+                            chunks.push(Chunk {
+                                text,
+                                chunk_type: ChunkType::ListItem,
+                                heading_context: heading_stack
+                                    .iter()
+                                    .map(|(_, s)| s.clone())
+                                    .collect(),
+                                heading_level: None,
+                                page_number: None,
+                                source_line_start: item_start_line,
+                                source_line_end: line_num
+                                    .saturating_sub(1)
+                                    .max(item_start_line),
+                            });
+                        }
+                    }
+                    item_text_buf.clear();
+                    item_start_line = line_num;
+
+                    // Handle description list \item[Term]
+                    if let Some(term) = caps.get(1) {
+                        if env == "description" {
+                            item_text_buf.push_str(term.as_str());
+                            item_text_buf.push_str(": ");
+                        }
+                    }
+                    let rest = caps.get(2).map_or("", |m| m.as_str()).trim();
+                    if !rest.is_empty() {
+                        item_text_buf.push_str(rest);
+                    }
+                    state = LatexState::List {
+                        env: env.clone(),
+                        depth: new_depth,
+                    };
+                    continue;
+                }
+            }
+
+            // Accumulate text for current item
+            if !trimmed.is_empty() {
+                if !item_text_buf.is_empty() {
+                    item_text_buf.push(' ');
+                }
+                item_text_buf.push_str(trimmed);
+            }
+            state = LatexState::List {
+                env: env.clone(),
+                depth: new_depth,
+            };
+            continue;
+        }
+
+        // === Normal state processing ===
+
+        // Handle $$ delimiters
+        if trimmed.starts_with("$$") {
+            // Check for single-line $$...$$
+            let after = &trimmed[2..];
+            if let Some(end_pos) = after.find("$$") {
+                let math_content = after[..end_pos].trim();
+                flush_latex_paragraph(
+                    &mut chunks,
+                    &mut text_buf,
+                    &heading_stack,
+                    block_start_line,
+                    line_num.saturating_sub(1),
+                    re,
+                );
+                if !math_content.is_empty() {
+                    chunks.push(Chunk {
+                        text: math_content.to_string(),
+                        chunk_type: ChunkType::MathBlock,
+                        heading_context: heading_stack
+                            .iter()
+                            .map(|(_, s)| s.clone())
+                            .collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: line_num,
+                        source_line_end: line_num,
+                    });
+                }
+                continue;
+            }
+            // Multi-line $$ math
+            flush_latex_paragraph(
+                &mut chunks,
+                &mut text_buf,
+                &heading_stack,
+                block_start_line,
+                line_num.saturating_sub(1),
+                re,
+            );
+            state = LatexState::DollarMath;
+            block_start_line = line_num;
+            text_buf.clear();
+            let rest = trimmed[2..].trim();
+            if !rest.is_empty() {
+                text_buf.push_str(rest);
+            }
+            continue;
+        }
+
+        // Handle \[ delimiter
+        if trimmed.starts_with(r"\[") {
+            // Check for single-line \[...\]
+            let after = &trimmed[2..];
+            if let Some(end_pos) = after.find(r"\]") {
+                let math_content = after[..end_pos].trim();
+                flush_latex_paragraph(
+                    &mut chunks,
+                    &mut text_buf,
+                    &heading_stack,
+                    block_start_line,
+                    line_num.saturating_sub(1),
+                    re,
+                );
+                if !math_content.is_empty() {
+                    chunks.push(Chunk {
+                        text: math_content.to_string(),
+                        chunk_type: ChunkType::MathBlock,
+                        heading_context: heading_stack
+                            .iter()
+                            .map(|(_, s)| s.clone())
+                            .collect(),
+                        heading_level: None,
+                        page_number: None,
+                        source_line_start: line_num,
+                        source_line_end: line_num,
+                    });
+                }
+                continue;
+            }
+            // Multi-line \[ math
+            flush_latex_paragraph(
+                &mut chunks,
+                &mut text_buf,
+                &heading_stack,
+                block_start_line,
+                line_num.saturating_sub(1),
+                re,
+            );
+            state = LatexState::BracketMath;
+            block_start_line = line_num;
+            text_buf.clear();
+            let rest = trimmed[2..].trim();
+            if !rest.is_empty() {
+                text_buf.push_str(rest);
+            }
+            continue;
+        }
+
+        // Check for \begin{...}
+        if let Some(caps) = re.begin_env.captures(trimmed) {
+            let env_name = caps.get(1).unwrap().as_str();
+            match classify_env(env_name) {
+                EnvKind::Verbatim => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    state = LatexState::Verbatim {
+                        env: env_name.to_string(),
+                        depth: 1,
+                    };
+                    block_start_line = line_num;
+                    text_buf.clear();
+                    continue;
+                }
+                EnvKind::Math => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    state = LatexState::Math {
+                        env: env_name.to_string(),
+                        depth: 1,
+                    };
+                    block_start_line = line_num;
+                    text_buf.clear();
+                    continue;
+                }
+                EnvKind::Theorem => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    state = LatexState::Theorem {
+                        env: env_name.to_string(),
+                        depth: 1,
+                    };
+                    block_start_line = line_num;
+                    text_buf.clear();
+                    continue;
+                }
+                EnvKind::Table => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    state = LatexState::Table {
+                        env: env_name.to_string(),
+                        depth: 1,
+                    };
+                    block_start_line = line_num;
+                    text_buf.clear();
+                    continue;
+                }
+                EnvKind::Quote => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    state = LatexState::Quote {
+                        env: env_name.to_string(),
+                        depth: 1,
+                    };
+                    block_start_line = line_num;
+                    text_buf.clear();
+                    continue;
+                }
+                EnvKind::List => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    state = LatexState::List {
+                        env: env_name.to_string(),
+                        depth: 1,
+                    };
+                    block_start_line = line_num;
+                    item_text_buf.clear();
+                    item_start_line = line_num;
+                    continue;
+                }
+                EnvKind::Abstract => {
+                    flush_latex_paragraph(
+                        &mut chunks,
+                        &mut text_buf,
+                        &heading_stack,
+                        block_start_line,
+                        line_num.saturating_sub(1),
+                        re,
+                    );
+                    block_start_line = line_num + 1;
+                    continue;
+                }
+                EnvKind::Unknown => {
+                    // Strip \begin{...} marker, process inner content normally
+                    continue;
+                }
+            }
+        }
+
+        // Check for \end{...} in Normal state (for abstract and unknown envs)
+        if let Some(caps) = re.end_env.captures(trimmed) {
+            let env_name = caps.get(1).unwrap().as_str();
+            if classify_env(env_name) == EnvKind::Abstract {
+                flush_latex_paragraph(
+                    &mut chunks,
+                    &mut text_buf,
+                    &heading_stack,
+                    block_start_line,
+                    line_num,
+                    re,
+                );
+            }
+            // Skip \end{...} lines for unknown envs too
+            continue;
+        }
+
+        // Check for sectioning commands
+        if let Some(caps) = re.section.captures(trimmed) {
+            flush_latex_paragraph(
+                &mut chunks,
+                &mut text_buf,
+                &heading_stack,
+                block_start_line,
+                line_num.saturating_sub(1),
+                re,
+            );
+
+            let cmd = caps.get(1).unwrap().as_str();
+            let title = caps.get(2).unwrap().as_str().trim().to_string();
+            let title = clean_latex_inline(&title, re);
+            let title = title.trim().to_string();
+            let level = section_level(cmd);
+
+            heading_stack.retain(|(l, _)| *l < level);
+            heading_stack.push((level, title.clone()));
+
+            chunks.push(Chunk {
+                text: title,
+                chunk_type: ChunkType::Heading,
+                heading_context: heading_stack.iter().map(|(_, s)| s.clone()).collect(),
+                heading_level: Some(level),
+                page_number: None,
+                source_line_start: line_num,
+                source_line_end: line_num,
+            });
+            continue;
+        }
+
+        // Blank line — flush paragraph (but skip comment-only lines)
+        if trimmed.is_empty() {
+            if raw_line.trim().is_empty() {
+                flush_latex_paragraph(
+                    &mut chunks,
+                    &mut text_buf,
+                    &heading_stack,
+                    block_start_line,
+                    line_num.saturating_sub(1),
+                    re,
+                );
+            }
+            continue;
+        }
+
+        // Regular text line — accumulate
+        let cleaned = clean_latex_inline(trimmed, re);
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        if text_buf.is_empty() {
+            block_start_line = line_num;
+        }
+        if !text_buf.is_empty() {
+            text_buf.push(' ');
+        }
+        text_buf.push_str(cleaned);
+    }
+
+    // Flush any remaining text
+    flush_latex_paragraph(
+        &mut chunks,
+        &mut text_buf,
+        &heading_stack,
+        block_start_line,
+        end_idx,
+        re,
+    );
+
+    chunks
+}
+
+// ---------------------------------------------------------------------------
+// Format-aware wrappers
+// ---------------------------------------------------------------------------
+
+pub fn chunk_document_fmt(content: &str, format: Format) -> Vec<Chunk> {
+    match format {
+        Format::Markdown => chunk_markdown(content),
+        Format::Latex => chunk_latex(content),
+    }
+}
+
+pub fn chunk_pages_fmt(pages: &[Page], format: Format) -> Vec<Chunk> {
+    let mut all_chunks = Vec::new();
+    for page in pages {
+        let page_content = page.raw_lines_sans_marker().join("\n");
+        let mut chunks = chunk_document_fmt(&page_content, format);
+        for chunk in &mut chunks {
+            chunk.page_number = Some(page.number);
+            chunk.source_line_start += page.start_line;
+            chunk.source_line_end += page.start_line;
+        }
+        all_chunks.extend(chunks);
+    }
+    all_chunks
 }
 
 // ---------------------------------------------------------------------------
@@ -1797,5 +2750,599 @@ Third page only line";
         let chunks = chunk_markdown("See [[Page#^foo|display text]] for details");
         let text = &chunks[0].text;
         assert!(text.contains("display text"));
+    }
+
+    // ========================================================================
+    // LaTeX chunking tests
+    // ========================================================================
+
+    // -- ChunkType serialization ---------------------------------------------
+
+    #[test]
+    fn test_chunk_type_math_block_serializes() {
+        let json = serde_json::to_string(&ChunkType::MathBlock).unwrap();
+        assert_eq!(json, "\"math_block\"");
+    }
+
+    #[test]
+    fn test_chunk_type_theorem_serializes() {
+        let json = serde_json::to_string(&ChunkType::Theorem).unwrap();
+        assert_eq!(json, "\"theorem\"");
+    }
+
+    // -- validate_extension .tex ---------------------------------------------
+
+    #[test]
+    fn test_validate_tex_extension() {
+        assert!(validate_extension("file.tex").is_ok());
+    }
+
+    // -- Format + detect_format ----------------------------------------------
+
+    #[test]
+    fn test_detect_format_md() {
+        assert_eq!(detect_format("file.md"), Format::Markdown);
+    }
+
+    #[test]
+    fn test_detect_format_txt() {
+        assert_eq!(detect_format("file.txt"), Format::Markdown);
+    }
+
+    #[test]
+    fn test_detect_format_stdin() {
+        assert_eq!(detect_format("-"), Format::Markdown);
+    }
+
+    #[test]
+    fn test_detect_format_tex() {
+        assert_eq!(detect_format("file.tex"), Format::Latex);
+    }
+
+    // -- chunk_latex: paragraphs (Step 4) ------------------------------------
+
+    #[test]
+    fn test_latex_empty() {
+        assert!(chunk_latex("").is_empty());
+    }
+
+    #[test]
+    fn test_latex_whitespace_only() {
+        assert!(chunk_latex("   \n  \n  ").is_empty());
+    }
+
+    #[test]
+    fn test_latex_single_paragraph() {
+        let chunks = chunk_latex("Hello world.");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Paragraph);
+        assert_eq!(chunks[0].text, "Hello world.");
+    }
+
+    #[test]
+    fn test_latex_two_paragraphs() {
+        let chunks = chunk_latex("First paragraph.\n\nSecond paragraph.");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "First paragraph.");
+        assert_eq!(chunks[1].text, "Second paragraph.");
+    }
+
+    // -- Sectioning commands (Step 5) ----------------------------------------
+
+    #[test]
+    fn test_latex_section() {
+        let chunks = chunk_latex(r"\section{Introduction}");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Heading);
+        assert_eq!(chunks[0].text, "Introduction");
+        assert_eq!(chunks[0].heading_level, Some(2));
+    }
+
+    #[test]
+    fn test_latex_subsection() {
+        let chunks = chunk_latex(r"\subsection{Details}");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_level, Some(3));
+    }
+
+    #[test]
+    fn test_latex_subsubsection() {
+        let chunks = chunk_latex(r"\subsubsection{Fine Details}");
+        assert_eq!(chunks[0].heading_level, Some(4));
+    }
+
+    #[test]
+    fn test_latex_chapter() {
+        let chunks = chunk_latex(r"\chapter{Chapter One}");
+        assert_eq!(chunks[0].heading_level, Some(1));
+    }
+
+    #[test]
+    fn test_latex_part() {
+        let chunks = chunk_latex(r"\part{Part One}");
+        assert_eq!(chunks[0].heading_level, Some(1));
+    }
+
+    #[test]
+    fn test_latex_paragraph_cmd() {
+        let chunks = chunk_latex(r"\paragraph{Note}");
+        assert_eq!(chunks[0].heading_level, Some(5));
+    }
+
+    #[test]
+    fn test_latex_subparagraph_cmd() {
+        let chunks = chunk_latex(r"\subparagraph{Sub Note}");
+        assert_eq!(chunks[0].heading_level, Some(6));
+    }
+
+    #[test]
+    fn test_latex_starred_section() {
+        let chunks = chunk_latex(r"\section*{Unnumbered}");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Unnumbered");
+        assert_eq!(chunks[0].heading_level, Some(2));
+    }
+
+    #[test]
+    fn test_latex_heading_context_propagation() {
+        let input = "\\section{Intro}\n\nSome text.\n\n\\subsection{Sub}\n\nMore text.";
+        let chunks = chunk_latex(input);
+        let more = chunks.iter().find(|c| c.text == "More text.").unwrap();
+        assert_eq!(more.heading_context, vec!["Intro", "Sub"]);
+    }
+
+    #[test]
+    fn test_latex_heading_context_reset() {
+        let input = "\\section{A}\n\n\\subsection{B}\n\ntext b\n\n\\section{C}\n\ntext c";
+        let chunks = chunk_latex(input);
+        let text_c = chunks.iter().find(|c| c.text == "text c").unwrap();
+        assert_eq!(text_c.heading_context, vec!["C"]);
+    }
+
+    // -- Comment stripping (Step 6) ------------------------------------------
+
+    #[test]
+    fn test_latex_inline_comment() {
+        let chunks = chunk_latex("Hello world. % this is a comment");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Hello world.");
+    }
+
+    #[test]
+    fn test_latex_full_line_comment() {
+        let chunks = chunk_latex("First line.\n% full comment\nSecond line.");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("First line."));
+        assert!(chunks[0].text.contains("Second line."));
+        assert!(!chunks[0].text.contains("full comment"));
+    }
+
+    #[test]
+    fn test_latex_escaped_percent() {
+        let chunks = chunk_latex(r"The rate is 50\% effective.");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("50%"));
+    }
+
+    // -- List environments (Step 7) ------------------------------------------
+
+    #[test]
+    fn test_latex_itemize() {
+        let input = "\\begin{itemize}\n\\item Apple\n\\item Banana\n\\end{itemize}";
+        let chunks = chunk_latex(input);
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "Apple");
+        assert_eq!(items[1].text, "Banana");
+    }
+
+    #[test]
+    fn test_latex_enumerate() {
+        let input = "\\begin{enumerate}\n\\item First\n\\item Second\n\\end{enumerate}";
+        let chunks = chunk_latex(input);
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "First");
+    }
+
+    #[test]
+    fn test_latex_description() {
+        let input = "\\begin{description}\n\\item[Term] Definition text\n\\end{description}";
+        let chunks = chunk_latex(input);
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].text.contains("Term:"));
+        assert!(items[0].text.contains("Definition text"));
+    }
+
+    #[test]
+    fn test_latex_multiline_item() {
+        let input = "\\begin{itemize}\n\\item First line\n  continued here.\n\\item Second\n\\end{itemize}";
+        let chunks = chunk_latex(input);
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].text.contains("First line"));
+        assert!(items[0].text.contains("continued here."));
+    }
+
+    #[test]
+    fn test_latex_nested_list() {
+        let input = "\\begin{itemize}\n\\item Outer\n\\begin{enumerate}\n\\item Inner\n\\end{enumerate}\n\\end{itemize}";
+        let chunks = chunk_latex(input);
+        let items: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::ListItem).collect();
+        // Nested items get flattened into the outer item
+        assert!(!items.is_empty());
+    }
+
+    // -- Verbatim/code environments (Step 8) ---------------------------------
+
+    #[test]
+    fn test_latex_verbatim() {
+        let input = "\\begin{verbatim}\nlet x = 1;\n\\end{verbatim}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::CodeBlock);
+        assert_eq!(chunks[0].text, "let x = 1;");
+    }
+
+    #[test]
+    fn test_latex_lstlisting() {
+        let input = "\\begin{lstlisting}\ndef hello():\n    pass\n\\end{lstlisting}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::CodeBlock);
+        assert!(chunks[0].text.contains("def hello():"));
+    }
+
+    #[test]
+    fn test_latex_minted() {
+        let input = "\\begin{minted}\nfn main() {}\n\\end{minted}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::CodeBlock);
+    }
+
+    #[test]
+    fn test_latex_verbatim_preserves_content() {
+        // Commands inside verbatim should not be processed
+        let input = "\\begin{verbatim}\n\\textbf{not bold} % not a comment\n\\end{verbatim}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks[0].text, "\\textbf{not bold} % not a comment");
+    }
+
+    // -- Table environments (Step 9) -----------------------------------------
+
+    #[test]
+    fn test_latex_tabular() {
+        let input = "\\begin{tabular}{|c|c|}\na & b \\\\\nc & d \\\\\n\\end{tabular}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Table);
+    }
+
+    #[test]
+    fn test_latex_table_nested_tabular() {
+        let input = "\\begin{table}\n\\begin{tabular}{cc}\na & b\n\\end{tabular}\n\\end{table}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Table);
+    }
+
+    // -- BlockQuote environments (Step 10) -----------------------------------
+
+    #[test]
+    fn test_latex_quote() {
+        let input = "\\begin{quote}\nTo be or not to be.\n\\end{quote}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::BlockQuote);
+        assert!(chunks[0].text.contains("To be or not to be."));
+    }
+
+    #[test]
+    fn test_latex_quotation_multiline() {
+        let input = "\\begin{quotation}\nFirst line.\nSecond line.\n\\end{quotation}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::BlockQuote);
+        assert!(chunks[0].text.contains("First line."));
+        assert!(chunks[0].text.contains("Second line."));
+    }
+
+    // -- Display math (Step 11) ----------------------------------------------
+
+    #[test]
+    fn test_latex_equation_env() {
+        let input = "\\begin{equation}\nE = mc^2\n\\end{equation}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::MathBlock);
+        assert!(chunks[0].text.contains("E = mc^2"));
+    }
+
+    #[test]
+    fn test_latex_align_env() {
+        let input = "\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::MathBlock);
+    }
+
+    #[test]
+    fn test_latex_dollar_dollar_math() {
+        let input = "$$\nx = y + z\n$$";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::MathBlock);
+        assert!(chunks[0].text.contains("x = y + z"));
+    }
+
+    #[test]
+    fn test_latex_bracket_math() {
+        let input = "\\[\na^2 + b^2 = c^2\n\\]";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::MathBlock);
+        assert!(chunks[0].text.contains("a^2 + b^2 = c^2"));
+    }
+
+    #[test]
+    fn test_latex_inline_math_in_paragraph() {
+        let chunks = chunk_latex("The equation $E = mc^2$ is famous.");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Paragraph);
+        assert!(chunks[0].text.contains("$E = mc^2$"));
+    }
+
+    #[test]
+    fn test_latex_equation_star() {
+        let input = "\\begin{equation*}\nx = 1\n\\end{equation*}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::MathBlock);
+    }
+
+    #[test]
+    fn test_latex_align_star() {
+        let input = "\\begin{align*}\na &= 1\n\\end{align*}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks[0].chunk_type, ChunkType::MathBlock);
+    }
+
+    // -- Theorem-like environments (Step 12) ---------------------------------
+
+    #[test]
+    fn test_latex_theorem() {
+        let input = "\\begin{theorem}\nAll primes greater than 2 are odd.\n\\end{theorem}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Theorem);
+        assert!(chunks[0].text.contains("All primes"));
+    }
+
+    #[test]
+    fn test_latex_lemma() {
+        let input = "\\begin{lemma}\nA helper result.\n\\end{lemma}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Theorem);
+    }
+
+    #[test]
+    fn test_latex_proof() {
+        let input = "\\begin{proof}\nBy contradiction.\n\\end{proof}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Theorem);
+    }
+
+    #[test]
+    fn test_latex_definition_env() {
+        let input = "\\begin{definition}\nA group is...\n\\end{definition}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Theorem);
+    }
+
+    #[test]
+    fn test_latex_theorem_heading_context() {
+        let input = "\\section{Results}\n\n\\begin{theorem}\nSome theorem.\n\\end{theorem}";
+        let chunks = chunk_latex(input);
+        let thm = chunks.iter().find(|c| c.chunk_type == ChunkType::Theorem).unwrap();
+        assert_eq!(thm.heading_context, vec!["Results"]);
+    }
+
+    // -- Inline formatting cleanup (Step 13) ---------------------------------
+
+    #[test]
+    fn test_latex_textbf_stripped() {
+        let chunks = chunk_latex("This is \\textbf{bold} text.");
+        assert_eq!(chunks[0].text, "This is bold text.");
+    }
+
+    #[test]
+    fn test_latex_textit_stripped() {
+        let chunks = chunk_latex("This is \\textit{italic} text.");
+        assert_eq!(chunks[0].text, "This is italic text.");
+    }
+
+    #[test]
+    fn test_latex_emph_stripped() {
+        let chunks = chunk_latex("This is \\emph{emphasized} text.");
+        assert_eq!(chunks[0].text, "This is emphasized text.");
+    }
+
+    #[test]
+    fn test_latex_label_removed() {
+        let chunks = chunk_latex("Some text.\\label{sec:intro}");
+        assert!(!chunks[0].text.contains("label"));
+        assert!(!chunks[0].text.contains("sec:intro"));
+    }
+
+    #[test]
+    fn test_latex_ref_kept() {
+        let chunks = chunk_latex("See \\ref{sec:intro} for details.");
+        assert!(chunks[0].text.contains("\\ref{sec:intro}"));
+    }
+
+    #[test]
+    fn test_latex_cite_kept() {
+        let chunks = chunk_latex("As shown in \\cite{smith2020}.");
+        assert!(chunks[0].text.contains("\\cite{smith2020}"));
+    }
+
+    // -- Preamble handling (Step 14) -----------------------------------------
+
+    #[test]
+    fn test_latex_preamble_dropped() {
+        let input = "\\documentclass{article}\n\\usepackage{amsmath}\n\\begin{document}\nHello world.\n\\end{document}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Hello world.");
+        assert!(!chunks.iter().any(|c| c.text.contains("documentclass")));
+    }
+
+    #[test]
+    fn test_latex_no_document_fragment() {
+        // No \begin{document} — chunk entire content
+        let chunks = chunk_latex("\\section{Test}\n\nSome text.");
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_latex_abstract() {
+        let input = "\\begin{document}\n\\begin{abstract}\nThis paper studies...\n\\end{abstract}\n\\end{document}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Paragraph);
+        assert!(chunks[0].text.contains("This paper studies"));
+    }
+
+    // -- Source line tracking (Step 15) --------------------------------------
+
+    #[test]
+    fn test_latex_paragraph_line_numbers() {
+        let chunks = chunk_latex("Hello world.");
+        assert_eq!(chunks[0].source_line_start, 1);
+        assert_eq!(chunks[0].source_line_end, 1);
+    }
+
+    #[test]
+    fn test_latex_multiline_paragraph_span() {
+        let chunks = chunk_latex("Line one\nline two\nline three.");
+        assert_eq!(chunks[0].source_line_start, 1);
+        assert_eq!(chunks[0].source_line_end, 3);
+    }
+
+    #[test]
+    fn test_latex_section_line_numbers() {
+        let input = "\n\n\\section{Hello}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks[0].source_line_start, 3);
+        assert_eq!(chunks[0].source_line_end, 3);
+    }
+
+    // -- Format-aware wrappers (Step 16) -------------------------------------
+
+    #[test]
+    fn test_chunk_document_fmt_markdown() {
+        let chunks = chunk_document_fmt("# Hello\n\nWorld", Format::Markdown);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Heading);
+    }
+
+    #[test]
+    fn test_chunk_document_fmt_latex() {
+        let chunks = chunk_document_fmt("\\section{Hello}\n\nWorld.", Format::Latex);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Heading);
+        assert_eq!(chunks[1].chunk_type, ChunkType::Paragraph);
+    }
+
+    #[test]
+    fn test_chunk_pages_fmt_latex() {
+        let input = "<!-- Page 1 - 1 image -->\n\\section{A}\n\nContent A\n\n<!-- Page 2 - 1 image -->\nContent B";
+        let pages = parse_pages(input).unwrap();
+        let chunks = chunk_pages_fmt(&pages, Format::Latex);
+        assert!(chunks.iter().all(|c| c.page_number.is_some()));
+        assert!(chunks.iter().any(|c| c.chunk_type == ChunkType::Heading));
+    }
+
+    // -- Unknown environments + edge cases (Step 19) -------------------------
+
+    #[test]
+    fn test_latex_center_env() {
+        let input = "\\begin{center}\nCentered text.\n\\end{center}";
+        let chunks = chunk_latex(input);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chunk_type, ChunkType::Paragraph);
+        assert_eq!(chunks[0].text, "Centered text.");
+    }
+
+    #[test]
+    fn test_latex_figure_with_caption() {
+        let input = "\\begin{figure}\n\\includegraphics[width=0.5\\textwidth]{img.png}\n\\caption{A nice figure}\n\\end{figure}";
+        let chunks = chunk_latex(input);
+        assert!(chunks.iter().any(|c| c.text.contains("A nice figure")));
+        assert!(!chunks.iter().any(|c| c.text.contains("includegraphics")));
+    }
+
+    #[test]
+    fn test_latex_unicode() {
+        let chunks = chunk_latex("namaḥ śivāya");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "namaḥ śivāya");
+    }
+
+    #[test]
+    fn test_latex_empty_section() {
+        let input = "\\section{Empty}\n\n\\section{Full}\n\nContent.";
+        let chunks = chunk_latex(input);
+        let headings: Vec<&Chunk> = chunks.iter().filter(|c| c.chunk_type == ChunkType::Heading).collect();
+        assert_eq!(headings.len(), 2);
+    }
+
+    #[test]
+    fn test_latex_nbsp() {
+        let chunks = chunk_latex("Figure~1 shows the result.");
+        assert_eq!(chunks[0].text, "Figure 1 shows the result.");
+    }
+
+    #[test]
+    fn test_latex_with_page_markers() {
+        let input = "<!-- Page 1 - 2 images -->\n\\section{Title}\n\nContent.";
+        let pages = parse_pages(input).unwrap();
+        let chunks = chunk_pages_fmt(&pages, Format::Latex);
+        assert!(chunks.iter().any(|c| c.text == "Title"));
+        assert!(chunks.iter().any(|c| c.text == "Content."));
+    }
+
+    // -- format_chunks_table for new types -----------------------------------
+
+    #[test]
+    fn test_format_chunks_table_math_block() {
+        let chunks = vec![Chunk {
+            text: "x = 1".to_string(),
+            chunk_type: ChunkType::MathBlock,
+            heading_context: vec![],
+            heading_level: None,
+            page_number: None,
+            source_line_start: 1,
+            source_line_end: 1,
+        }];
+        let table = format_chunks_table(&chunks);
+        assert!(table.contains("math_block"));
+    }
+
+    #[test]
+    fn test_format_chunks_table_theorem() {
+        let chunks = vec![Chunk {
+            text: "A theorem.".to_string(),
+            chunk_type: ChunkType::Theorem,
+            heading_context: vec![],
+            heading_level: None,
+            page_number: None,
+            source_line_start: 1,
+            source_line_end: 1,
+        }];
+        let table = format_chunks_table(&chunks);
+        assert!(table.contains("theorem"));
     }
 }

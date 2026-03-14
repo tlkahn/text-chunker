@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                    # dev build
 cargo build --release          # release build (needed for smoke test)
-cargo test                     # run all 76 tests
+cargo test                     # run all 204 tests
 cargo test test_name           # run a single test by name
-cargo test mcp::               # run only MCP handler tests (15 tests)
+cargo test mcp::               # run only MCP handler tests (18 tests)
+cargo test latex               # run only LaTeX chunking tests
 cargo test -- --nocapture      # show println output during tests
 ```
 
@@ -22,9 +23,9 @@ uv run smoke_test.py
 
 Three-file split with a strict separation of concerns:
 
-- **src/lib.rs** — All domain logic and types. `ChunkerError`, `Page`, `SearchMatch`, `LineMode`, `LinesResult`, and all public functions (`parse_pages`, `parse_page_range`, `search_pages`, `collect_page_lines`, `format_pages_table`, `format_search_results`, `split_pages`, `pages_to_json`, `lines_to_json`, `search_to_json`, `validate_extension`). All 61 domain tests live here.
+- **src/lib.rs** — All domain logic and types. `ChunkerError`, `Page`, `SearchMatch`, `LineMode`, `LinesResult`, `Format`, `ChunkType` (including `MathBlock`, `Theorem`), and all public functions (`parse_pages`, `parse_page_range`, `search_pages`, `collect_page_lines`, `format_pages_table`, `format_search_results`, `split_pages`, `pages_to_json`, `lines_to_json`, `search_to_json`, `validate_extension`, `detect_format`, `chunk_markdown`, `chunk_latex`, `chunk_document_fmt`, `chunk_pages_fmt`). All 186 domain tests live here.
 - **src/main.rs** — CLI only. `Cli` and `Commands` (clap derive), `main()`, `run()`, `read_input()`. Imports everything via `use text_chunker::*`. The `Mcp` subcommand short-circuits before file extraction.
-- **src/mcp.rs** — MCP server. Three testable content-based handlers (`handle_pages_content`, `handle_lines_content`, `handle_search_content`) that take `&str` and return `Result<String, ChunkerError>`. File-reading wrappers (`handle_pages`, `handle_lines`, `handle_search`) add validation + I/O. `TextChunkerMcp` struct uses rmcp's `#[tool_router]`/`#[tool_handler]` macros. 15 handler tests.
+- **src/mcp.rs** — MCP server. Testable content-based handlers (`handle_pages_content`, `handle_lines_content`, `handle_search_content`, `handle_chunks_content_fmt`) that take `&str` and return `Result<String, ChunkerError>`. File-reading wrappers (`handle_pages`, `handle_lines`, `handle_search`, `handle_chunks`) add validation + I/O + format detection. `TextChunkerMcp` struct uses rmcp's `#[tool_router]`/`#[tool_handler]` macros. 18 handler tests.
 
 Key design decision: MCP handlers take `&str` content (not file paths) so they're unit-testable without touching the filesystem. The file-reading wrappers are thin and untested.
 

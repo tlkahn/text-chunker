@@ -6,8 +6,8 @@
 """
 Smoke Test -- CLI + MCP smoke tests for text-chunker
 
-Phase 1 (CLI): Runs 5 CLI commands via subprocess and validates output.
-               No API key needed.
+Phase 1 (CLI): Runs 6 CLI commands via subprocess and validates output.
+               No API key needed. Tests both Markdown and LaTeX chunking.
 Phase 2 (MCP): Python Agent calling the text-chunker MCP server.
                Requires ANTHROPIC_API_KEY.
 
@@ -84,6 +84,45 @@ Term One
 This has ==highlighted text== inside. ^block-anchor
 """
 
+LATEX_FIXTURE = r"""
+\documentclass{article}
+\usepackage{amsmath}
+
+\begin{document}
+
+\section{Introduction}
+
+This paper presents our \textbf{main result}.
+The rate is 50\% effective. % this is a comment
+
+\begin{theorem}
+All primes greater than 2 are odd.
+\end{theorem}
+
+\begin{equation}
+E = mc^2
+\end{equation}
+
+\subsection{Details}
+
+\begin{itemize}
+\item First item
+\item Second item
+\end{itemize}
+
+\begin{verbatim}
+fn main() {}
+\end{verbatim}
+
+\begin{quote}
+To be or not to be.
+\end{quote}
+
+Figure~1 shows the result.
+
+\end{document}
+"""
+
 TOOL_LABELS = {
     "pages": ("Listing pages", GREEN),
     "lines": ("Reading lines", CYAN),
@@ -133,11 +172,83 @@ def validate_chunks(json_str: str) -> list[str]:
     return failures
 
 
-def run_cli_smoke_test(binary: str, fixture_path: str, split_dir: str) -> bool:
+def validate_latex_chunks(json_str: str) -> list[str]:
+    """Validate LaTeX chunking output. Returns list of failure messages."""
+    data = json.loads(json_str)
+    texts = [c["text"] for c in data["chunks"]]
+    types = [c["chunk_type"] for c in data["chunks"]]
+    joined = " ".join(texts)
+
+    failures = []
+    if "heading" not in types:
+        failures.append("no heading chunk")
+    if "paragraph" not in types:
+        failures.append("no paragraph chunk")
+    if "theorem" not in types:
+        failures.append("no theorem chunk")
+    if "math_block" not in types:
+        failures.append("no math_block chunk")
+    if "list_item" not in types:
+        failures.append("no list_item chunk")
+    if "code_block" not in types:
+        failures.append("no code_block chunk")
+    if "block_quote" not in types:
+        failures.append("no block_quote chunk")
+
+    # Section parsed correctly
+    if not any(t == "Introduction" for t in texts):
+        failures.append("section title not extracted")
+    # Heading context propagation
+    heading_chunks = [c for c in data["chunks"] if c["chunk_type"] == "heading"]
+    if not any(c["heading_level"] == 3 for c in heading_chunks):
+        failures.append("subsection level wrong")
+
+    # Inline formatting stripped
+    if "\\textbf" in joined:
+        failures.append("\\textbf not stripped")
+    if "main result" not in joined:
+        failures.append("textbf content lost")
+
+    # Comment stripped
+    if "this is a comment" in joined:
+        failures.append("comment not stripped")
+
+    # Escaped percent preserved
+    if "50%" not in joined:
+        failures.append("escaped percent lost")
+
+    # Preamble dropped
+    if "documentclass" in joined:
+        failures.append("preamble not dropped")
+
+    # Theorem content
+    if not any("primes" in t for t in texts):
+        failures.append("theorem content lost")
+
+    # Math block
+    if not any("E = mc^2" in t for t in texts):
+        failures.append("equation content lost")
+
+    # Verbatim preserved
+    if not any("fn main()" in t for t in texts):
+        failures.append("verbatim content lost")
+
+    # Quote
+    if not any("To be or not to be" in t for t in texts):
+        failures.append("quote content lost")
+
+    # Non-breaking space
+    if "Figure 1" not in joined:
+        failures.append("~ not replaced with space")
+
+    return failures
+
+
+def run_cli_smoke_test(binary: str, fixture_path: str, latex_path: str, split_dir: str) -> bool:
     """Run CLI commands and validate output. Returns True if all pass."""
     passed = 0
     failed = 0
-    total_checks = 5
+    total_checks = 6
 
     def check(name: str, args: list[str], validator, detail_fn=None):
         nonlocal passed, failed
@@ -189,6 +300,12 @@ def run_cli_smoke_test(binary: str, fixture_path: str, split_dir: str) -> bool:
     check("split", [binary, "split", fixture_path, "--outdir", split_dir],
           lambda out: Path(split_dir, "page-000.md").exists())
 
+    # 6. LaTeX chunks --json
+    num_latex_checks = 16
+    check("latex-chunks", [binary, "--json", "chunks", latex_path],
+          lambda out: validate_latex_chunks(out),
+          detail_fn=lambda: f" ({num_latex_checks}/{num_latex_checks} checks)")
+
     print(f"\n  CLI: {passed}/{total_checks} passed")
     return failed == 0
 
@@ -223,19 +340,25 @@ async def main():
         print("Build it first: cargo build --release")
         return
 
-    # Write fixture to a temp .md file
+    # Write fixtures to temp files
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".md", delete=False
     ) as f:
         f.write(FIXTURE)
         fixture_path = f.name
 
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".tex", delete=False
+    ) as f:
+        f.write(LATEX_FIXTURE)
+        latex_path = f.name
+
     split_dir = tempfile.mkdtemp(prefix="text-chunker-split-")
 
     try:
         # Phase 1: CLI smoke test (no API key needed)
         print(f"{BOLD}Phase 1: CLI Smoke Test{RESET}")
-        cli_ok = run_cli_smoke_test(BINARY, fixture_path, split_dir)
+        cli_ok = run_cli_smoke_test(BINARY, fixture_path, latex_path, split_dir)
 
         # Phase 2: MCP smoke test (needs ANTHROPIC_API_KEY)
         if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -258,7 +381,7 @@ Available tools:
 - pages(file) -- list all pages with metadata
 - lines(file, page, mode?) -- get lines from a page or range
 - search(file, term) -- search for text across all pages
-- chunks(file, per_page?) -- chunk markdown into structural segments for embedding
+- chunks(file, per_page?) -- chunk markdown or LaTeX into structural segments for embedding
 - split(file, outdir) -- split into individual page files
 
 The test document is at: {fixture_path}
@@ -324,6 +447,7 @@ answer the user's question. Do not skip any tool calls.""",
 
     finally:
         os.unlink(fixture_path)
+        os.unlink(latex_path)
         import shutil
         shutil.rmtree(split_dir, ignore_errors=True)
 

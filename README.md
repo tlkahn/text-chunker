@@ -2,7 +2,7 @@
 
 A Rust CLI tool for splitting page-marked documents into chunks. Built for OCR-processed Sanskrit manuscripts that use HTML comment markers (`<!-- Page N - M images -->`) to delimit pages.
 
-Includes structural markdown chunking (headings, paragraphs, lists, code blocks, tables, blockquotes) for embedding into vector databases, and an MCP (Model Context Protocol) server so LLM agents can query pages, lines, search results, and chunks programmatically over stdio.
+Includes structural chunking of both Markdown and LaTeX documents (headings, paragraphs, lists, code blocks, tables, blockquotes, math blocks, theorems) for embedding into vector databases, and an MCP (Model Context Protocol) server so LLM agents can query pages, lines, search results, and chunks programmatically over stdio.
 
 ## Installation
 
@@ -28,7 +28,7 @@ Whitespace inside the marker is flexible. Both `image` and `images` are accepted
 text-chunker [--json] <COMMAND> <FILE> [ARGS...]
 ```
 
-`<FILE>` is a `.md` or `.txt` file path, or `-` for stdin.
+`<FILE>` is a `.md`, `.txt`, or `.tex` file path, or `-` for stdin.
 
 ### Pages summary
 
@@ -75,14 +75,15 @@ text-chunker split manuscript.md --outdir ./pages
 
 Writes each page as `page-000.md`, `page-001.md`, etc. into the output directory (created if it doesn't exist).
 
-### Chunk markdown into structural segments
+### Chunk documents into structural segments
 
 ```bash
-text-chunker chunks manuscript.md              # document-level chunking
+text-chunker chunks manuscript.md              # document-level chunking (Markdown)
 text-chunker chunks manuscript.md --per-page   # chunk within each page separately
+text-chunker chunks paper.tex                  # LaTeX chunking (auto-detected)
 ```
 
-**Document mode** (default) treats the entire file as continuous markdown — no page markers required. Works on any `.md` file. **Per-page mode** requires page markers; it chunks each page independently so heading context doesn't bleed across pages.
+**Document mode** (default) treats the entire file as continuous content — no page markers required. Works on any `.md` or `.tex` file. **Per-page mode** requires page markers; it chunks each page independently so heading context doesn't bleed across pages. The format (Markdown vs LaTeX) is auto-detected from the file extension.
 
 ```
 #      Type         Lines          Text
@@ -97,11 +98,19 @@ Total: 5 chunks
 ```
 
 Each chunk includes:
-- **text** — clean extracted text (markdown syntax stripped)
-- **chunk_type** — `heading`, `paragraph`, `list_item`, `code_block`, `table`, or `block_quote`
+- **text** — clean extracted text (markup syntax stripped)
+- **chunk_type** — `heading`, `paragraph`, `list_item`, `code_block`, `table`, `block_quote`, `definition_item`, `math_block`, or `theorem`
 - **heading_context** — ancestor heading hierarchy, e.g. `["Chapter 1", "Background"]`
 - **source_line_start / source_line_end** — 1-based source line numbers
 - **page_number** — set in per-page mode
+
+#### Markdown support
+
+GFM extensions, math, footnotes, task lists, wikilinks, definition lists, and Obsidian syntax (comments, highlights, block anchors). Frontmatter is silently dropped.
+
+#### LaTeX support
+
+Sectioning commands (`\part` through `\subparagraph`, including starred variants), environments (`itemize`, `enumerate`, `description`, `verbatim`, `lstlisting`, `minted`, `tabular`, `table`, `quote`, `quotation`, `equation`, `align`, `theorem`, `lemma`, `proof`, `definition`, and more), display math delimiters (`$$` and `\[...\]`), preamble skipping (`\begin{document}`/`\end{document}`), comment stripping (unescaped `%`), and inline formatting cleanup (`\textbf`, `\emph`, `\label`, `\includegraphics`, etc.). Zero extra dependencies — uses a hand-rolled line scanner (~200 lines of Rust).
 
 ### JSON output
 
@@ -170,10 +179,10 @@ This exposes five tools to any MCP-compatible client:
 | `pages` | List all pages with metadata (page numbers, image counts, line ranges, content line counts) |
 | `lines` | Get lines from a page or range, with optional `mode` (`content`, `raw`, `no_markers`) |
 | `search` | Case-insensitive substring search across all pages |
-| `chunks` | Chunk markdown into structural segments for embedding, with optional `per_page` mode |
+| `chunks` | Chunk markdown or LaTeX into structural segments for embedding, with optional `per_page` mode |
 | `split` | Split pages into individual files in a given output directory |
 
-All tools accept a `file` parameter (path to a `.md` or `.txt` file) and return JSON.
+All tools accept a `file` parameter (path to a `.md`, `.txt`, or `.tex` file) and return JSON.
 
 ### Claude Desktop / MCP client config
 
@@ -202,7 +211,7 @@ cargo build --release
 uv run smoke_test.py
 ```
 
-**Phase 1 (CLI)** — always runs, no API key needed. Invokes all five subcommands (`pages`, `lines`, `search`, `chunks`, `split`) via `subprocess` and validates output, including GFM/Obsidian extension handling (math, footnotes, task lists, wikilinks, definition lists, highlight/comment/block-anchor stripping).
+**Phase 1 (CLI)** — always runs, no API key needed. Invokes subcommands (`pages`, `lines`, `search`, `chunks`, `split`) via `subprocess` and validates output, including GFM/Obsidian extension handling (math, footnotes, task lists, wikilinks, definition lists, highlight/comment/block-anchor stripping) and LaTeX chunking (sections, theorems, math blocks, lists, verbatim).
 
 **Phase 2 (MCP)** — runs only when `ANTHROPIC_API_KEY` is set. A Python agent (Claude Agent SDK) calls all five MCP tools over stdio and verifies each was exercised.
 
@@ -212,7 +221,7 @@ uv run smoke_test.py
 cargo test
 ```
 
-108 tests covering parsing, search, structural chunking, output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), MCP handler functions, and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, heading context isolation, etc.).
+204 tests covering parsing, search, structural chunking (Markdown and LaTeX), output formatting, JSON serialisation, error handling, line modes (`--raw`, `--no-markers`), MCP handler functions, and edge cases (Windows line endings, Unicode search, non-sequential pages, duplicate markers, heading context isolation, LaTeX preamble handling, nested environments, comment stripping, etc.).
 
 ## License
 
